@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "notes-tools.v1",
+  "tools": [
+    "notes.search",
+    "notes.list",
+    "notes.get",
+    "notes.create",
+    "notes.append",
+    "notes.update",
+    "notes.rename",
+    "notes.move",
+    "notes.tags",
+    "notes.backlinks",
+    "notes.tasks",
+    "notes.archive",
+    "notes.trash",
+    "notes.restore"
+  ]
+}

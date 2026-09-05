@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cinqic.com/schemas/notes/notes-core.v1.schema.json",
+  "title": "Cinqic Notes Core note",
+  "type": "object",
+  "required": ["id", "path", "title", "format", "contentHash"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(^|/)\\.\\.?(/|$)).+\\.(md|txt)$"
+    },
+    "title": { "type": "string" },
+    "format": { "enum": ["markdown", "text"] },
+    "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  },
+  "additionalProperties": true
+}

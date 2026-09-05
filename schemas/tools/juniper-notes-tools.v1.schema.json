@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cinqic.com/schemas/tools/juniper-notes-tools.v1.schema.json",
+  "title": "Cinqic Notes Core tool names",
+  "type": "object",
+  "required": ["schemaVersion", "tools"],
+  "properties": {
+    "schemaVersion": { "const": "notes-tools.v1" },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^notes\\.(search|list|get|create|append|update|rename|move|tags|backlinks|tasks|archive|trash|restore)$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": false
+}
