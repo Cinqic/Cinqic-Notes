@@ -25,3 +25,4 @@ tauri = { version = "2.8.1", features = ["test"] }
 tauri-plugin-dialog = "2.3.2"
 thiserror = "2.0.16"
 uuid = { version = "1.18.1", features = ["v4"] }
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

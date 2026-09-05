@@ -7,15 +7,17 @@ import type {
   BacklinkItem,
   ConflictInfo,
   GraphData,
+  LinkItem,
   LibraryInfo,
   NoteDocument,
   NoteSummary,
+  RecoveryDraftInfo,
   RevisionItem,
   SaveState,
   TaskItem,
 } from '../types'
 
-type View = 'all' | 'today' | 'projects' | 'tasks' | 'graph' | 'trash' | 'settings'
+type View = 'all' | 'today' | 'projects' | 'tasks' | 'graph' | 'archive' | 'trash' | 'settings'
 type Theme = 'system' | 'light' | 'dark'
 
 const isDesktop = () => '__TAURI_INTERNALS__' in window
@@ -24,6 +26,16 @@ const displayError = (error: unknown) => {
   if (typeof error === 'string') return error
   if (error && typeof error === 'object' && 'message' in error) return String(error.message)
   return 'Something went wrong. Your original file was not intentionally discarded.'
+}
+
+const relativeLibraryPath = (notePath: string, targetPath: string) => {
+  const noteDirectory = notePath.split('/').slice(0, -1)
+  const target = targetPath.split('/')
+  while (noteDirectory.length && target.length && noteDirectory[0] === target[0]) {
+    noteDirectory.shift()
+    target.shift()
+  }
+  return [...noteDirectory.map(() => '..'), ...target].join('/') || targetPath
 }
 
 export default function App() {
@@ -153,6 +165,7 @@ function NotesWorkspace({
   const [showShare, setShowShare] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [backlinks, setBacklinks] = useState<BacklinkItem[]>([])
+  const [outgoingLinks, setOutgoingLinks] = useState<LinkItem[]>([])
   const [revisions, setRevisions] = useState<RevisionItem[]>([])
   const [tasks, setTasks] = useState<TaskItem[]>([])
   const [graph, setGraph] = useState<GraphData | null>(null)
@@ -164,8 +177,8 @@ function NotesWorkspace({
   const loadNotes = useCallback(
     async (nextQuery = query, includeTrashed = view === 'trash') => {
       const result = nextQuery.trim()
-        ? await notesApi.searchNotes(nextQuery.trim(), includeTrashed)
-        : await notesApi.listNotes(includeTrashed)
+        ? await notesApi.searchNotesFiltered(nextQuery.trim(), includeTrashed, view === 'archive')
+        : await notesApi.listNotesFiltered(includeTrashed, view === 'archive')
       setNotes(result)
       return result
     },
@@ -181,8 +194,14 @@ function NotesWorkspace({
       setSaveState('saved')
       setError('')
       setConflict(null)
-      setBacklinks(await notesApi.getBacklinks(path))
-      setRevisions(await notesApi.listRevisions(path))
+      const [nextBacklinks, nextRevisions, nextOutgoingLinks] = await Promise.all([
+        notesApi.getBacklinks(path),
+        notesApi.listRevisions(path),
+        notesApi.getOutgoingLinks(path),
+      ])
+      setBacklinks(nextBacklinks)
+      setRevisions(nextRevisions)
+      setOutgoingLinks(nextOutgoingLinks)
     } catch (nextError: unknown) {
       setError(displayError(nextError))
     }
@@ -199,6 +218,7 @@ function NotesWorkspace({
           setContent('')
           setBacklinks([])
           setRevisions([])
+          setOutgoingLinks([])
         }
       } catch (nextError: unknown) {
         setError(displayError(nextError))
@@ -239,6 +259,14 @@ function NotesWorkspace({
 
   useEffect(() => {
     if (!activeDocument || saveState !== 'dirty') return
+    const timer = window.setTimeout(() => {
+      void notesApi.saveRecoveryDraft(activeDocument.path, content)
+    }, 5000)
+    return () => window.clearTimeout(timer)
+  }, [activeDocument, content, saveState])
+
+  useEffect(() => {
+    if (!activeDocument || saveState !== 'dirty') return
     const path = activeDocument.path
     const expectedHash = activeDocument.hash
     const contentToSave = content
@@ -274,9 +302,9 @@ function NotesWorkspace({
     return () => window.clearTimeout(timer)
   }, [activeDocument, content, saveState])
 
-  const createNote = async () => {
+  const createNote = async (startingTitle = 'Untitled') => {
     try {
-      const doc = await notesApi.createNote('Untitled', 'markdown')
+      const doc = await notesApi.createNote(startingTitle, 'markdown')
       setView('all')
       setActiveDocument(doc)
       setContent(doc.content)
@@ -285,6 +313,7 @@ function NotesWorkspace({
       setNotes((current) => [doc, ...current.filter((note) => note.path !== doc.path)])
       setBacklinks([])
       setRevisions([])
+      setOutgoingLinks([])
       setMessage('New note')
       window.setTimeout(() => editorRef.current?.focus(), 50)
     } catch (nextError: unknown) {
@@ -299,6 +328,7 @@ function NotesWorkspace({
       const doc = await notesApi.updateNote(activeDocument.path, content, activeDocument.hash)
       setActiveDocument(doc)
       setContent(doc.content)
+      setRevisions(await notesApi.listRevisions(doc.path))
       setSaveState('saved')
       setMessage('Saved locally')
       window.setTimeout(() => setMessage(''), 1800)
@@ -320,8 +350,97 @@ function NotesWorkspace({
       setNotes((current) => current.map((note) => (note.path === activeDocument.path ? doc : note)))
       setBacklinks(await notesApi.getBacklinks(doc.path))
       setRevisions(await notesApi.listRevisions(doc.path))
+      setOutgoingLinks(await notesApi.getOutgoingLinks(doc.path))
     } catch (nextError: unknown) {
       setTitleDraft(activeDocument.title)
+      setError(displayError(nextError))
+    }
+  }
+
+  const createDailyNote = async () => {
+    try {
+      const doc = await notesApi.createDailyNote(new Date().toISOString().slice(0, 10))
+      setView('all')
+      setActiveDocument(doc)
+      setContent(doc.content)
+      setTitleDraft(doc.title)
+      setSaveState('saved')
+      await refresh(doc.path)
+      window.setTimeout(() => editorRef.current?.focus(), 50)
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
+  const moveNote = async () => {
+    if (!activeDocument) return
+    const folder = window.prompt('Move this note to a Library folder (leave blank for root):', '')
+    if (folder === null) return
+    try {
+      const doc = await notesApi.moveNote(activeDocument.path, folder.trim())
+      setActiveDocument(doc)
+      setContent(doc.content)
+      setTitleDraft(doc.title)
+      await refresh(doc.path)
+      setMessage('Note moved')
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
+  const archiveNote = async () => {
+    if (!activeDocument) return
+    try {
+      const archived = !activeDocument.archived
+      const doc = await notesApi.archiveNote(activeDocument.path, archived)
+      setMessage(archived ? 'Note archived' : 'Note restored to All notes')
+      if (archived && view !== 'archive') {
+        setActiveDocument(null)
+        setContent('')
+        setBacklinks([])
+        setRevisions([])
+        setOutgoingLinks([])
+        await refresh()
+      } else {
+        setActiveDocument(doc)
+        setContent(doc.content)
+        setTitleDraft(doc.title)
+        await refresh(doc.path)
+      }
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
+  const attachFiles = async () => {
+    if (!activeDocument) return
+    try {
+      const chosen = await open({
+        multiple: true,
+        filters: [
+          {
+            name: 'Attachments',
+            extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf', 'zip', 'docx', 'xlsx'],
+          },
+        ],
+      })
+      const paths = Array.isArray(chosen) ? chosen : chosen ? [chosen] : []
+      if (!paths.length) return
+      const links: string[] = []
+      for (const path of paths) {
+        const attachment = await notesApi.importAttachment(path)
+        const relative = relativeLibraryPath(activeDocument.path, attachment.path)
+        const name = attachment.path.split('/').pop() || 'attachment'
+        const image = /\.(png|jpe?g|gif|webp|svg)$/i.test(attachment.path)
+        links.push(image ? '![' + name + '](' + relative + ')' : '[' + name + '](' + relative + ')')
+      }
+      setContent(
+        (current) =>
+          current + (current.endsWith('\n') ? '' : '\n') + '\n' + links.join('\n') + '\n',
+      )
+      setSaveState('dirty')
+      setMessage(links.length + ' attachment' + (links.length === 1 ? '' : 's') + ' added')
+    } catch (nextError: unknown) {
       setError(displayError(nextError))
     }
   }
@@ -370,6 +489,44 @@ function NotesWorkspace({
     }
   }
 
+  const exportBackup = async () => exportBackupWithMode(false)
+
+  const exportBackupWithMode = async (includeInternal: boolean) => {
+    try {
+      const destination = await save({
+        defaultPath: includeInternal ? 'Cinqic Notes full backup.zip' : 'Cinqic Notes backup.zip',
+        filters: [{ name: 'ZIP backup', extensions: ['zip'] }],
+      })
+      if (!destination) return
+      await notesApi.backupLibrary(destination, includeInternal)
+      setMessage(includeInternal ? 'Full backup exported' : 'Library backup exported')
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
+  const recoverDraft = async (draft: RecoveryDraftInfo) => {
+    try {
+      const [doc, draftContent] = await Promise.all([
+        notesApi.getNote(draft.notePath),
+        notesApi.readRecoveryDraft(draft.path),
+      ])
+      setView('all')
+      setShowSettings(false)
+      setActiveDocument(doc)
+      setContent(draftContent)
+      setTitleDraft(doc.title)
+      setSaveState('dirty')
+      setConflict(null)
+      setBacklinks(await notesApi.getBacklinks(doc.path))
+      setRevisions(await notesApi.listRevisions(doc.path))
+      setOutgoingLinks(await notesApi.getOutgoingLinks(doc.path))
+      setMessage('Recovery draft opened — review before saving')
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
   const selectView = (nextView: View) => {
     setView(nextView)
     setQuery('')
@@ -379,6 +536,7 @@ function NotesWorkspace({
       nextView === 'all' ||
       nextView === 'today' ||
       nextView === 'projects' ||
+      nextView === 'archive' ||
       nextView === 'trash'
     ) {
       void loadNotes('', nextView === 'trash')
@@ -398,6 +556,23 @@ function NotesWorkspace({
       } else if (event.key.toLowerCase() === 'k') {
         event.preventDefault()
         setShowCommandPalette(true)
+      } else if (
+        activeDocument &&
+        editorRef.current === document.activeElement &&
+        (event.key.toLowerCase() === 'b' || event.key.toLowerCase() === 'i')
+      ) {
+        event.preventDefault()
+        const editor = editorRef.current
+        const start = editor.selectionStart
+        const end = editor.selectionEnd
+        const marker = event.key.toLowerCase() === 'b' ? '**' : '*'
+        const selected = content.slice(start, end)
+        setContent(content.slice(0, start) + marker + selected + marker + content.slice(end))
+        setSaveState('dirty')
+        requestAnimationFrame(() => {
+          editor.focus()
+          editor.setSelectionRange(start + marker.length, end + marker.length)
+        })
       } else if (event.key.toLowerCase() === 'f' && document.activeElement !== editorRef.current) {
         event.preventDefault()
         document.querySelector<HTMLInputElement>('.search-input')?.focus()
@@ -413,6 +588,7 @@ function NotesWorkspace({
       return notes.filter((note) => new Date(note.modifiedAt).toDateString() === today)
     }
     if (view === 'projects') return notes.filter((note) => note.project)
+    if (view === 'archive') return notes.filter((note) => note.archived)
     return notes
   }, [notes, view])
 
@@ -428,6 +604,11 @@ function NotesWorkspace({
             : 'Save error'
   const commandActions: Array<[string, () => void | Promise<void>]> = [
     ['New note', () => void createNote()],
+    ['Daily note', () => void createDailyNote()],
+    ['Quick scratch note', () => void createNote('Scratch')],
+    ['Move current note…', () => void moveNote()],
+    ['Archive current note', () => void archiveNote()],
+    ['Export Library backup', () => void exportBackup()],
     [
       'Search notes',
       () => {
@@ -490,6 +671,12 @@ function NotesWorkspace({
               label="Projects"
               active={view === 'projects'}
               onClick={() => selectView('projects')}
+            />
+            <NavItem
+              icon="□"
+              label="Archive"
+              active={view === 'archive'}
+              onClick={() => selectView('archive')}
             />
             <NavItem
               icon="☑"
@@ -595,6 +782,16 @@ function NotesWorkspace({
         ) : view === 'trash' ? (
           <TrashView
             notes={notes}
+            onEmpty={async () => {
+              if (!window.confirm('Permanently remove every note in Trash?')) return
+              try {
+                const removed = await notesApi.emptyTrash()
+                await refresh()
+                setMessage(`${removed} note${removed === 1 ? '' : 's'} permanently removed`)
+              } catch (nextError: unknown) {
+                setError(displayError(nextError))
+              }
+            }}
             onRestore={async (path) => {
               try {
                 const doc = await notesApi.restoreNote(path)
@@ -615,6 +812,8 @@ function NotesWorkspace({
             theme={theme}
             setTheme={setTheme}
             library={library}
+            onBackup={exportBackupWithMode}
+            onRecoverDraft={recoverDraft}
             onRebuild={async () => {
               const next = await notesApi.rebuildIndex()
               setLibrary(next)
@@ -653,7 +852,15 @@ function NotesWorkspace({
               onToggleList={() => setShowList(!showList)}
               onSave={() => void forceSave()}
               onTrash={() => void moveToTrash()}
+              onMove={() => void moveNote()}
+              onArchive={() => void archiveNote()}
+              onAttach={() => void attachFiles()}
               backlinks={backlinks}
+              outgoingLinks={outgoingLinks}
+              onOpenLink={(path) => {
+                setView('all')
+                void selectNote(path)
+              }}
               error={error}
               message={message}
               editorRef={editorRef}
@@ -666,6 +873,15 @@ function NotesWorkspace({
                       setContent(doc.content)
                       setConflict(null)
                       setSaveState('saved')
+                      return Promise.all([
+                        notesApi.getBacklinks(doc.path),
+                        notesApi.listRevisions(doc.path),
+                        notesApi.getOutgoingLinks(doc.path),
+                      ]).then(([nextBacklinks, nextRevisions, nextOutgoingLinks]) => {
+                        setBacklinks(nextBacklinks)
+                        setRevisions(nextRevisions)
+                        setOutgoingLinks(nextOutgoingLinks)
+                      })
                     })
                     .catch((nextError: unknown) => setError(displayError(nextError)))
               }}
@@ -677,7 +893,9 @@ function NotesWorkspace({
                   const doc = await notesApi.restoreRevision(activeDocument.path, revisionId)
                   setActiveDocument(doc)
                   setContent(doc.content)
+                  setBacklinks(await notesApi.getBacklinks(doc.path))
                   setRevisions(await notesApi.listRevisions(doc.path))
+                  setOutgoingLinks(await notesApi.getOutgoingLinks(doc.path))
                   setSaveState('saved')
                   setMessage('Revision restored')
                 } catch (nextError: unknown) {
@@ -759,8 +977,18 @@ function NoteList({
     <section className="note-list-panel" aria-label="Notes">
       <div className="list-heading">
         <div>
-          <span className="eyebrow">{view === 'trash' ? 'RECOVERABLE' : 'YOUR LIBRARY'}</span>
-          <h2>{view === 'trash' ? 'Trash' : view === 'projects' ? 'Projects' : 'Notes'}</h2>
+          <span className="eyebrow">
+            {view === 'trash' || view === 'archive' ? 'RECOVERABLE' : 'YOUR LIBRARY'}
+          </span>
+          <h2>
+            {view === 'trash'
+              ? 'Trash'
+              : view === 'projects'
+                ? 'Projects'
+                : view === 'archive'
+                  ? 'Archive'
+                  : 'Notes'}
+          </h2>
         </div>
         <button className="icon-button" aria-label="Import notes" onClick={onImport}>
           ↥
@@ -826,9 +1054,11 @@ function NoteList({
 function TrashView({
   notes,
   onRestore,
+  onEmpty,
 }: {
   notes: NoteSummary[]
   onRestore: (path: string) => Promise<void>
+  onEmpty: () => Promise<void>
 }) {
   const trashed = notes.filter((note) => note.trashed)
   return (
@@ -839,6 +1069,13 @@ function TrashView({
         <p>Deleted notes stay local until you choose to remove them from the Library.</p>
       </div>
       <div className="trash-list">
+        {trashed.length > 0 && (
+          <div className="trash-actions">
+            <button className="button secondary small" onClick={() => void onEmpty()}>
+              Empty Trash
+            </button>
+          </div>
+        )}
         {trashed.map((note) => (
           <div className="trash-row" key={note.id}>
             <span className="note-file-icon">{note.format === 'markdown' ? 'M' : 'T'}</span>
@@ -875,7 +1112,12 @@ function EditorPane({
   onToggleList,
   onSave,
   onTrash,
+  onMove,
+  onArchive,
+  onAttach,
   backlinks,
+  outgoingLinks,
+  onOpenLink,
   error,
   message,
   editorRef,
@@ -895,7 +1137,12 @@ function EditorPane({
   onToggleList: () => void
   onSave: () => void
   onTrash: () => void
+  onMove: () => void
+  onArchive: () => void
+  onAttach: () => void
   backlinks: BacklinkItem[]
+  outgoingLinks: LinkItem[]
+  onOpenLink: (path: string) => void
   error: string
   message: string
   editorRef: React.RefObject<HTMLTextAreaElement | null>
@@ -943,6 +1190,9 @@ function EditorPane({
         <button className="toolbar-button" onClick={onSave}>
           Save
         </button>
+        <button className="toolbar-button" onClick={onAttach}>
+          Attach
+        </button>
         <button
           className="icon-button"
           aria-label="More note actions"
@@ -952,6 +1202,10 @@ function EditorPane({
         </button>
         {showMeta && (
           <div className="more-menu">
+            <button onClick={onMove}>Move to folder…</button>
+            <button onClick={onArchive}>
+              {document.archived ? 'Unarchive note' : 'Archive note'}
+            </button>
             <button onClick={onTrash}>Move to Trash</button>
             <button onClick={() => setShowMeta(false)}>Close menu</button>
           </div>
@@ -1004,13 +1258,41 @@ function EditorPane({
               BACKLINKS <span>{backlinks.length}</span>
             </div>
             {backlinks.map((link) => (
-              <div key={`${link.sourcePath}-${link.label}`} className="backlink-item">
+              <button
+                key={`${link.sourcePath}-${link.label}`}
+                className="backlink-item"
+                onClick={() => onOpenLink(link.sourcePath)}
+              >
                 <span>↗</span>
                 <span>
                   <strong>{link.sourceTitle}</strong>
                   <small>{link.label}</small>
                 </span>
-              </div>
+              </button>
+            ))}
+          </div>
+        )}
+        {outgoingLinks.length > 0 && (
+          <div className="backlinks outgoing-links">
+            <div className="section-label">
+              OUTGOING LINKS <span>{outgoingLinks.length}</span>
+            </div>
+            {outgoingLinks.map((link) => (
+              <button
+                key={link.targetPath + '-' + link.label}
+                className="backlink-item"
+                disabled={!link.resolved}
+                onClick={() => link.resolved && onOpenLink(link.targetPath)}
+              >
+                <span>{link.resolved ? '↘' : '?'}</span>
+                <span>
+                  <strong>{link.targetTitle || link.targetPath}</strong>
+                  <small>
+                    {link.label}
+                    {link.resolved ? '' : ' · unresolved'}
+                  </small>
+                </span>
+              </button>
             ))}
           </div>
         )}
@@ -1184,14 +1466,65 @@ function SettingsView({
   theme,
   setTheme,
   library,
+  onBackup,
+  onRecoverDraft,
   onRebuild,
 }: {
   theme: Theme
   setTheme: (value: Theme) => void
   library: LibraryInfo
+  onBackup: (includeInternal: boolean) => Promise<void>
+  onRecoverDraft: (draft: RecoveryDraftInfo) => Promise<void>
   onRebuild: () => Promise<void>
 }) {
   const [working, setWorking] = useState(false)
+  const [integrity, setIntegrity] = useState('')
+  const [drafts, setDrafts] = useState<RecoveryDraftInfo[]>([])
+  const [notice, setNotice] = useState('')
+
+  useEffect(() => {
+    void notesApi
+      .listRecoveryDrafts()
+      .then(setDrafts)
+      .catch(() => setDrafts([]))
+  }, [])
+
+  const verifyIntegrity = async () => {
+    setWorking(true)
+    try {
+      const result = await notesApi.verifyIntegrity()
+      setIntegrity(result.ok ? 'Database integrity verified.' : result.message)
+    } catch (nextError: unknown) {
+      setIntegrity(displayError(nextError))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  const runBackup = async (includeInternal: boolean) => {
+    setWorking(true)
+    try {
+      await onBackup(includeInternal)
+      setNotice(includeInternal ? 'Full backup exported.' : 'Library backup exported.')
+    } catch (nextError: unknown) {
+      setNotice(displayError(nextError))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  const runRebuild = async () => {
+    setWorking(true)
+    try {
+      await onRebuild()
+      setNotice('Index rebuilt from your files.')
+    } catch (nextError: unknown) {
+      setNotice(displayError(nextError))
+    } finally {
+      setWorking(false)
+    }
+  }
+
   return (
     <section className="utility-view settings-view">
       <div className="utility-heading">
@@ -1222,6 +1555,75 @@ function SettingsView({
         </section>
         <section className="settings-card">
           <div>
+            <span className="setting-icon">↓</span>
+            <div>
+              <h2>Backup</h2>
+              <p>
+                Export ordinary files, with an optional full local snapshot of revisions and
+                settings.
+              </p>
+            </div>
+          </div>
+          <div className="setting-actions">
+            <button
+              className="button secondary small"
+              disabled={working}
+              onClick={() => void runBackup(false)}
+            >
+              Library ZIP
+            </button>
+            <button
+              className="button secondary small"
+              disabled={working}
+              onClick={() => void runBackup(true)}
+            >
+              Full backup ZIP
+            </button>
+          </div>
+          {notice && <span className="setting-status muted">{notice}</span>}
+        </section>
+        <section className="settings-card">
+          <div>
+            <span className="setting-icon">✓</span>
+            <div>
+              <h2>Repair and recovery</h2>
+              <p>
+                Rebuild the index, verify the local database, or reopen an autosave draft for
+                review.
+              </p>
+            </div>
+          </div>
+          <div className="setting-actions">
+            <button
+              className="button secondary small"
+              disabled={working}
+              onClick={() => void verifyIntegrity()}
+            >
+              Verify database
+            </button>
+            {integrity && <span className="setting-status muted">{integrity}</span>}
+          </div>
+          {drafts.length > 0 && (
+            <div className="recovery-list">
+              <span className="section-label">AUTOSAVE DRAFTS</span>
+              {drafts.map((draft) => (
+                <div className="recovery-row" key={draft.path}>
+                  <span>
+                    <strong>{draft.notePath}</strong>
+                    <small>
+                      {draft.size} characters · {formatRelativeDate(draft.createdAt)}
+                    </small>
+                  </span>
+                  <button className="button quiet small" onClick={() => void onRecoverDraft(draft)}>
+                    Open draft
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+        <section className="settings-card">
+          <div>
             <span className="setting-icon">⌂</span>
             <div>
               <h2>Notes Library</h2>
@@ -1234,10 +1636,7 @@ function SettingsView({
             <button
               className="button secondary small"
               disabled={working}
-              onClick={() => {
-                setWorking(true)
-                void onRebuild().finally(() => setWorking(false))
-              }}
+              onClick={() => void runRebuild()}
             >
               {working ? 'Rebuilding…' : 'Rebuild index'}
             </button>

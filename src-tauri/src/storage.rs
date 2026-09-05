@@ -1,16 +1,23 @@
 use crate::domain::{
-    self, BacklinkItem, ConflictInfo, GraphData, GraphEdge, GraphNode, LibraryInfo, NoteDocument,
-    NoteFormat, NoteSummary, RevisionItem, TaskItem,
+    self, AttachmentItem, BacklinkItem, ConflictInfo, GraphData, GraphEdge, GraphNode,
+    IntegrityInfo, LibraryInfo, LinkItem, NoteDocument, NoteFormat, NoteSummary, RecoveryDraftInfo,
+    RevisionItem, TagItem, TaskItem,
 };
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
+use zip::CompressionMethod;
+use zip::ZipArchive;
+use zip::write::{SimpleFileOptions, ZipWriter};
 
 const INDEX_DIR: &str = ".cinqic";
+const MAX_ARCHIVE_MEMBER_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_ARCHIVE_TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -26,6 +33,8 @@ pub enum StorageError {
     Conflict,
     #[error("unsupported note format")]
     UnsupportedFormat,
+    #[error("archive error: {0}")]
+    Archive(String),
     #[error("{0}")]
     Message(String),
 }
@@ -105,11 +114,34 @@ impl Library {
     pub fn rebuild_index(&self) -> StorageResult<LibraryInfo> {
         let files = collect_note_files(&self.root)?;
         let mut connection = self.connection()?;
+        let existing: HashMap<String, (String, String, bool)> = connection
+            .prepare("SELECT path, id, created_at, archived FROM notes")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(path, id, created_at, archived)| (path, (id, created_at, archived)))
+            .collect();
         let transaction = connection.transaction()?;
         transaction.execute_batch("DELETE FROM links; DELETE FROM tasks; DELETE FROM note_tags; DELETE FROM notes_fts; DELETE FROM notes;")?;
         for (path, content) in &files {
             let relative = relative_path(&self.root, path)?;
-            insert_note(&transaction, &relative, content, None)?;
+            let prior = existing
+                .get(&relative)
+                .map(|(id, created_at, _)| (id.clone(), created_at.clone()));
+            insert_note(&transaction, &relative, content, prior)?;
+            if existing.get(&relative).is_some_and(|value| value.2) {
+                transaction.execute(
+                    "UPDATE notes SET archived = 1 WHERE path = ?1",
+                    params![relative],
+                )?;
+            }
         }
         resolve_links(&transaction)?;
         transaction.execute(
@@ -121,12 +153,21 @@ impl Library {
     }
 
     pub fn list_notes(&self, include_trashed: bool) -> StorageResult<Vec<NoteSummary>> {
+        self.list_notes_filtered(include_trashed, true)
+    }
+
+    pub fn list_notes_filtered(
+        &self,
+        include_trashed: bool,
+        include_archived: bool,
+    ) -> StorageResult<Vec<NoteSummary>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, path, title, format, preview, hash, modified_at, created_at, archived, trashed, project
-             FROM notes WHERE (?1 = 1 OR trashed = 0) ORDER BY updated_at DESC, title COLLATE NOCASE",
+             FROM notes WHERE (?1 = 1 OR trashed = 0) AND (?2 = 1 OR archived = 0) ORDER BY updated_at DESC, title COLLATE NOCASE",
         )?;
-        let rows = statement.query_map(params![include_trashed], summary_from_row)?;
+        let rows =
+            statement.query_map(params![include_trashed, include_archived], summary_from_row)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(self.attach_summary_data(&connection, row?)?);
@@ -166,8 +207,17 @@ impl Library {
         query: &str,
         include_trashed: bool,
     ) -> StorageResult<Vec<NoteSummary>> {
+        self.search_notes_filtered(query, include_trashed, true)
+    }
+
+    pub fn search_notes_filtered(
+        &self,
+        query: &str,
+        include_trashed: bool,
+        include_archived: bool,
+    ) -> StorageResult<Vec<NoteSummary>> {
         if query.trim().is_empty() {
-            return self.list_notes(include_trashed);
+            return self.list_notes_filtered(include_trashed, include_archived);
         }
         let connection = self.connection()?;
         let fts_query = query
@@ -177,17 +227,18 @@ impl Library {
             .collect::<Vec<_>>()
             .join(" AND ");
         if fts_query.is_empty() {
-            return self.list_notes(include_trashed);
+            return self.list_notes_filtered(include_trashed, include_archived);
         }
         let mut statement = connection.prepare(
             "SELECT n.id, n.path, n.title, n.format, n.preview, n.hash, n.modified_at, n.created_at, n.archived, n.trashed, n.project
              FROM notes n JOIN notes_fts f ON f.note_id = n.id
-             WHERE notes_fts MATCH ?1 AND (?2 = 1 OR n.trashed = 0)
+             WHERE notes_fts MATCH ?1 AND (?2 = 1 OR n.trashed = 0) AND (?3 = 1 OR n.archived = 0)
              ORDER BY bm25(notes_fts, 5.0, 2.0, 1.0, 1.0) ASC, n.updated_at DESC",
         )?;
-        let rows = statement.query_map(params![fts_query, include_trashed], |row| {
-            summary_from_row(row)
-        })?;
+        let rows = statement.query_map(
+            params![fts_query, include_trashed, include_archived],
+            summary_from_row,
+        )?;
         let mut result = Vec::new();
         for row in rows {
             result.push(self.attach_summary_data(&connection, row?)?);
@@ -203,14 +254,19 @@ impl Library {
         let content = fs::read_to_string(&absolute)?;
         let connection = self.connection()?;
         let relative = relative_path(&self.root, &absolute)?;
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM notes WHERE path = ?1)",
-            params![relative],
-            |row| row.get(0),
-        )?;
-        drop(connection);
-        if !exists {
+        let indexed_hash = connection
+            .query_row(
+                "SELECT hash FROM notes WHERE path = ?1",
+                params![relative],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let disk_hash = domain::hash_content(&content);
+        if indexed_hash.as_deref() != Some(disk_hash.as_str()) {
+            drop(connection);
             self.sync_file(&absolute, &content)?;
+        } else {
+            drop(connection);
         }
         let connection = self.connection()?;
         let summary = self.summary_by_path(&connection, &relative)?;
@@ -247,6 +303,127 @@ impl Library {
         atomic_write(&path, &content)?;
         self.sync_file(&path, &content)?;
         self.get_note(&relative_path(&self.root, &path)?)
+    }
+
+    pub fn create_daily_note(&self, date: &str) -> StorageResult<NoteDocument> {
+        let date = date.trim();
+        if date.len() != 10
+            || date.as_bytes().get(4) != Some(&b'-')
+            || date.as_bytes().get(7) != Some(&b'-')
+            || !date
+                .bytes()
+                .enumerate()
+                .all(|(index, value)| matches!(index, 4 | 7) || value.is_ascii_digit())
+        {
+            return Err(StorageError::InvalidPath("Invalid daily note date".into()));
+        }
+        let path = format!("{date}.md");
+        if self.root.join(&path).is_file() {
+            return self.get_note(&path);
+        }
+        self.create_note(date, NoteFormat::Markdown, "")
+    }
+
+    pub fn move_note(&self, path: &str, folder: &str) -> StorageResult<NoteDocument> {
+        let absolute = self.safe_path(path)?;
+        if !absolute.is_file() {
+            return Err(StorageError::NotFound(path.into()));
+        }
+        let folder = self.safe_relative_folder(folder)?;
+        let destination_directory = self.root.join(&folder);
+        fs::create_dir_all(&destination_directory)?;
+        let destination = destination_directory.join(
+            absolute
+                .file_name()
+                .ok_or_else(|| StorageError::InvalidPath(path.into()))?,
+        );
+        if destination == absolute {
+            return self.get_note(path);
+        }
+        if destination.exists() {
+            return Err(StorageError::Message(
+                "A note with that name already exists in the destination folder.".into(),
+            ));
+        }
+        let old_relative = relative_path(&self.root, &absolute)?;
+        fs::rename(&absolute, &destination)?;
+        let new_relative = relative_path(&self.root, &destination)?;
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE notes SET path = ?1, updated_at = ?2 WHERE path = ?3",
+            params![new_relative, now(), old_relative],
+        )?;
+        transaction.execute(
+            "UPDATE notes_fts SET path = ?1 WHERE note_id = (SELECT id FROM notes WHERE path = ?1)",
+            params![new_relative],
+        )?;
+        transaction.execute(
+            "UPDATE links SET target_path = ?1 WHERE target_path = ?2",
+            params![new_relative, old_relative],
+        )?;
+        transaction.execute(
+            "UPDATE trash SET original_path = ?1 WHERE original_path = ?2",
+            params![new_relative, old_relative],
+        )?;
+        resolve_links(&transaction)?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_note(&new_relative)
+    }
+
+    pub fn archive_note(&self, path: &str, archived: bool) -> StorageResult<NoteDocument> {
+        let relative = self.safe_relative(path)?;
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE notes SET archived = ?1, updated_at = ?2 WHERE path = ?3",
+            params![archived, now(), relative],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(path.into()));
+        }
+        drop(connection);
+        self.get_note(&relative)
+    }
+
+    pub fn reconcile_path(&self, path: &Path) -> StorageResult<()> {
+        if !path.starts_with(&self.root)
+            || path
+                .components()
+                .any(|component| component.as_os_str() == INDEX_DIR)
+        {
+            return Ok(());
+        }
+        let supports_notes = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .and_then(NoteFormat::from_extension)
+            .is_some();
+        if !supports_notes {
+            return Ok(());
+        }
+        let relative = relative_path(&self.root, path)?;
+        if path.is_file() {
+            if fs::symlink_metadata(path)?.file_type().is_symlink() {
+                return Ok(());
+            }
+            let content = fs::read_to_string(path)?;
+            self.sync_file(path, &content)?;
+            return Ok(());
+        }
+        let connection = self.connection()?;
+        let note_id = connection
+            .query_row(
+                "SELECT id FROM notes WHERE path = ?1",
+                params![relative],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(note_id) = note_id {
+            remove_note_rows(&connection, &note_id)?;
+            resolve_links(&connection)?;
+        }
+        Ok(())
     }
 
     pub fn update_note(
@@ -320,6 +497,10 @@ impl Library {
         connection.execute(
             "UPDATE notes SET path = ?1, updated_at = ?2 WHERE path = ?3",
             params![new_relative, now(), old_relative],
+        )?;
+        connection.execute(
+            "UPDATE notes_fts SET path = ?1 WHERE note_id = (SELECT id FROM notes WHERE path = ?1)",
+            params![new_relative],
         )?;
         connection.execute(
             "UPDATE trash SET original_path = ?1 WHERE original_path = ?2",
@@ -477,6 +658,387 @@ impl Library {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(GraphData { nodes, edges })
+    }
+
+    pub fn outgoing_links(&self, path: &str) -> StorageResult<Vec<LinkItem>> {
+        let relative = self.safe_relative(path)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT source.path, source.title, links.target_path, target.title, links.kind, links.label,
+                    CASE WHEN target.id IS NULL THEN 0 ELSE 1 END
+             FROM links
+             JOIN notes source ON source.id = links.source_id
+             LEFT JOIN notes target ON target.id = links.target_note_id
+             WHERE source.path = ?1
+             ORDER BY links.label COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map(params![relative], |row| {
+            Ok(LinkItem {
+                source_path: row.get(0)?,
+                source_title: row.get(1)?,
+                target_path: row.get(2)?,
+                target_title: row.get(3)?,
+                kind: row.get(4)?,
+                label: row.get(5)?,
+                resolved: row.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn list_tags(&self) -> StorageResult<Vec<TagItem>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT t.tag, COUNT(*) FROM note_tags t
+             JOIN notes n ON n.id = t.note_id
+             WHERE n.trashed = 0 AND n.archived = 0
+             GROUP BY t.tag ORDER BY t.tag COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(TagItem {
+                tag: row.get(0)?,
+                note_count: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn list_attachments(&self) -> StorageResult<Vec<AttachmentItem>> {
+        let mut files = Vec::new();
+        let directory = self.root.join("_attachments");
+        if directory.is_dir() {
+            collect_attachment_files(&directory, &directory, &mut files)?;
+        }
+        Ok(files)
+    }
+
+    pub fn import_attachment(&self, source: &str) -> StorageResult<AttachmentItem> {
+        let source = PathBuf::from(source);
+        let metadata = fs::symlink_metadata(&source)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(StorageError::InvalidPath(
+                "Attachments must be ordinary files".into(),
+            ));
+        }
+        let name = clean_file_name(
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("attachment"),
+        )?;
+        let directory = self.root.join("_attachments");
+        fs::create_dir_all(&directory)?;
+        let destination = unique_file_path(&directory, &name);
+        atomic_copy(&source, &destination)?;
+        self.attachment_item(&destination)
+    }
+
+    pub fn empty_trash(&self) -> StorageResult<u64> {
+        let connection = self.connection()?;
+        let rows = connection
+            .prepare("SELECT id, trash_path FROM trash")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let trash_root = self.root.join(INDEX_DIR).join("trash");
+        let canonical_trash_root = fs::canonicalize(&trash_root).unwrap_or(trash_root.clone());
+        let mut validated_paths = Vec::new();
+        for (id, value) in &rows {
+            let path = PathBuf::from(value);
+            if path.exists() {
+                let canonical = fs::canonicalize(&path)?;
+                if !canonical.starts_with(&canonical_trash_root) {
+                    return Err(StorageError::Message(format!(
+                        "Trash entry {id} contains an unsafe path; nothing was removed."
+                    )));
+                }
+                validated_paths.push((id.clone(), Some(canonical)));
+            } else {
+                validated_paths.push((id.clone(), None));
+            }
+        }
+        let mut removed = 0;
+        for (id, path) in validated_paths {
+            if let Some(path) = path
+                && path.exists()
+            {
+                fs::remove_file(path)?;
+            }
+            connection.execute("DELETE FROM trash WHERE id = ?1", params![id])?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    pub fn verify_integrity(&self) -> StorageResult<IntegrityInfo> {
+        let connection = self.connection()?;
+        let result: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(IntegrityInfo {
+            ok: result.eq_ignore_ascii_case("ok"),
+            message: result,
+        })
+    }
+
+    pub fn save_recovery_draft(
+        &self,
+        note_path: &str,
+        content: &str,
+    ) -> StorageResult<RecoveryDraftInfo> {
+        let note_path = self.safe_relative(note_path)?;
+        let directory = self.root.join(INDEX_DIR).join("recovery");
+        fs::create_dir_all(&directory)?;
+        let draft_id = &domain::hash_content(&format!("{note_path}\n{content}"))[..16];
+        let path = directory.join(format!("draft-{draft_id}.json"));
+        let record = serde_json::json!({
+            "notePath": note_path,
+            "content": content,
+            "createdAt": now(),
+        });
+        atomic_write(
+            &path,
+            &serde_json::to_string(&record).map_err(|error| {
+                StorageError::Message(format!("Could not encode recovery draft: {error}"))
+            })?,
+        )?;
+        self.recovery_draft_info(&path)
+    }
+
+    pub fn list_recovery_drafts(&self) -> StorageResult<Vec<RecoveryDraftInfo>> {
+        let directory = self.root.join(INDEX_DIR).join("recovery");
+        if !directory.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(info) = self.recovery_draft_info(&path) {
+                result.push(info);
+            }
+        }
+        result.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(result)
+    }
+
+    pub fn read_recovery_draft(&self, draft_path: &str) -> StorageResult<String> {
+        let path = self.safe_recovery_path(draft_path)?;
+        let content = fs::read_to_string(path)?;
+        let value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|error| StorageError::Message(format!("Invalid recovery draft: {error}")))?;
+        value
+            .get("content")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| StorageError::Message("Recovery draft has no content".into()))
+    }
+
+    pub fn remove_recovery_draft(&self, draft_path: &str) -> StorageResult<()> {
+        let path = self.safe_recovery_path(draft_path)?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn backup_library(&self, destination: &str, include_internal: bool) -> StorageResult<()> {
+        let destination = PathBuf::from(destination);
+        ensure_backup_destination(&self.root, &destination)?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = destination.with_file_name(format!(
+            ".{}-tmp-{}",
+            destination
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("backup.zip"),
+            Uuid::new_v4()
+        ));
+        let result = (|| {
+            let file = fs::File::create(&temporary)?;
+            let mut archive = ZipWriter::new(file);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let mut files = Vec::new();
+            collect_library_files(&self.root, &self.root, &mut files)?;
+            for (relative, content) in files {
+                archive
+                    .start_file(relative, options)
+                    .map_err(|error| StorageError::Archive(error.to_string()))?;
+                archive.write_all(&content)?;
+            }
+            if include_internal {
+                let manifest = self.backup_manifest()?;
+                archive
+                    .start_file(".cinqic/backup-manifest.json", options)
+                    .map_err(|error| StorageError::Archive(error.to_string()))?;
+                archive.write_all(manifest.as_bytes())?;
+            }
+            archive
+                .finish()
+                .map_err(|error| StorageError::Archive(error.to_string()))?;
+            replace_file(&temporary, &destination)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    pub fn restore_backup(&self, archive_path: &str, destination: &str) -> StorageResult<()> {
+        let archive_path = PathBuf::from(archive_path);
+        if !archive_path.is_file() {
+            return Err(StorageError::NotFound(archive_path.display().to_string()));
+        }
+        let destination = PathBuf::from(destination);
+        ensure_restore_destination(&self.root, &destination)?;
+        if destination.exists() && fs::read_dir(&destination)?.next().transpose()?.is_some() {
+            return Err(StorageError::Message(
+                "Restore destination must be empty so no files are overwritten.".into(),
+            ));
+        }
+        fs::create_dir_all(&destination)?;
+        let file = fs::File::open(archive_path)?;
+        let mut archive =
+            ZipArchive::new(file).map_err(|error| StorageError::Archive(error.to_string()))?;
+        let mut total_size = 0u64;
+        for index in 0..archive.len() {
+            let mut member = archive
+                .by_index(index)
+                .map_err(|error| StorageError::Archive(error.to_string()))?;
+            if member.is_dir() {
+                continue;
+            }
+            if member.size() > MAX_ARCHIVE_MEMBER_SIZE
+                || total_size.saturating_add(member.size()) > MAX_ARCHIVE_TOTAL_SIZE
+            {
+                return Err(StorageError::Message(
+                    "Backup exceeds the safe restore size limit.".into(),
+                ));
+            }
+            let relative = safe_archive_member(member.name())?;
+            let target = destination.join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            std::io::copy(&mut member, &mut output)?;
+            output.sync_all()?;
+            total_size = total_size.saturating_add(member.size());
+        }
+        restore_backup_manifest(&destination)?;
+        Ok(())
+    }
+
+    fn attachment_item(&self, path: &Path) -> StorageResult<AttachmentItem> {
+        let metadata = fs::metadata(path)?;
+        Ok(AttachmentItem {
+            path: relative_path(&self.root, path)?,
+            size: metadata.len(),
+            modified_at: file_modified_at(&metadata),
+        })
+    }
+
+    fn recovery_draft_info(&self, path: &Path) -> StorageResult<RecoveryDraftInfo> {
+        let content = fs::read_to_string(path)?;
+        let value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|error| StorageError::Message(format!("Invalid recovery draft: {error}")))?;
+        let created_at = value
+            .get("createdAt")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let note_path = value
+            .get("notePath")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        Ok(RecoveryDraftInfo {
+            path: relative_path(&self.root, path)?,
+            note_path,
+            created_at,
+            size: value
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or(0) as u64,
+        })
+    }
+
+    fn safe_recovery_path(&self, draft_path: &str) -> StorageResult<PathBuf> {
+        let normalized = draft_path.replace('\\', "/");
+        let filename = normalized
+            .strip_prefix(".cinqic/recovery/")
+            .or_else(|| normalized.strip_prefix("recovery/"))
+            .unwrap_or(&normalized);
+        let candidate = Path::new(&normalized);
+        if candidate.is_absolute()
+            || candidate.components().any(|part| {
+                matches!(
+                    part,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+            || filename.contains('/')
+            || filename.is_empty()
+        {
+            return Err(StorageError::InvalidPath(draft_path.into()));
+        }
+        if Path::new(filename)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("json")
+        {
+            return Err(StorageError::InvalidPath(draft_path.into()));
+        }
+        Ok(self.root.join(INDEX_DIR).join("recovery").join(filename))
+    }
+
+    fn backup_manifest(&self) -> StorageResult<String> {
+        let connection = self.connection()?;
+        let mut revisions_statement = connection.prepare(
+            "SELECT id, note_path, actor, reason, created_at, hash, content FROM revisions ORDER BY created_at",
+        )?;
+        let revisions = revisions_statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "notePath": row.get::<_, String>(1)?,
+                    "actor": row.get::<_, String>(2)?,
+                    "reason": row.get::<_, String>(3)?,
+                    "createdAt": row.get::<_, String>(4)?,
+                    "hash": row.get::<_, String>(5)?,
+                    "content": row.get::<_, String>(6)?,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut settings_statement =
+            connection.prepare("SELECT key, value FROM settings ORDER BY key")?;
+        let settings = settings_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        serde_json::to_string_pretty(&serde_json::json!({
+            "format": "cinqic-notes-backup",
+            "version": 1,
+            "createdAt": now(),
+            "revisions": revisions,
+            "settings": settings,
+        }))
+        .map_err(|error| {
+            StorageError::Message(format!("Could not encode backup manifest: {error}"))
+        })
     }
 
     pub fn import_files(&self, paths: &[String]) -> StorageResult<Vec<NoteSummary>> {
@@ -865,6 +1427,56 @@ fn collect_note_files_inner(
     Ok(())
 }
 
+fn collect_attachment_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<AttachmentItem>,
+) -> StorageResult<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_attachment_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let metadata = entry.metadata()?;
+            files.push(AttachmentItem {
+                path: relative_path(root, &path)?,
+                size: metadata.len(),
+                modified_at: file_modified_at(&metadata),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_library_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(String, Vec<u8>)>,
+) -> StorageResult<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if path.file_name().is_some_and(|value| value == INDEX_DIR) {
+                continue;
+            }
+            collect_library_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            files.push((relative_path(root, &path)?, fs::read(&path)?));
+        }
+    }
+    Ok(())
+}
+
 fn relative_path(root: &Path, path: &Path) -> StorageResult<String> {
     path.strip_prefix(root)
         .map_err(|_| StorageError::InvalidPath(path.display().to_string()))
@@ -908,6 +1520,48 @@ fn unique_path(root: &Path, title: &str, format: &NoteFormat) -> StorageResult<P
     Ok(path)
 }
 
+fn clean_file_name(value: &str) -> StorageResult<String> {
+    let cleaned = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if "<>:\"/\\|?*".contains(character) || character.is_control() {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim_matches([' ', '.'])
+        .to_owned();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return Err(StorageError::InvalidPath(
+            "Attachment needs a valid file name".into(),
+        ));
+    }
+    Ok(cleaned)
+}
+
+fn unique_file_path(directory: &Path, name: &str) -> PathBuf {
+    let original = Path::new(name);
+    let stem = original
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let extension = original
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let mut path = directory.join(name);
+    let mut suffix = 2;
+    while path.exists() {
+        path = directory.join(format!("{stem} {suffix}{extension}"));
+        suffix += 1;
+    }
+    path
+}
+
 fn atomic_write(path: &Path, content: &str) -> StorageResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -921,18 +1575,168 @@ fn atomic_write(path: &Path, content: &str) -> StorageResult<()> {
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    match fs::rename(&temporary, path) {
+    replace_file(&temporary, path)
+}
+
+fn atomic_copy(source: &Path, destination: &Path) -> StorageResult<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let temporary = destination.with_file_name(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+    fs::copy(source, &temporary)?;
+    let file = OpenOptions::new().write(true).open(&temporary)?;
+    file.sync_all()?;
+    drop(file);
+    replace_file(&temporary, destination)
+}
+
+fn replace_file(temporary: &Path, destination: &Path) -> StorageResult<()> {
+    match fs::rename(temporary, destination) {
         Ok(()) => Ok(()),
-        Err(_) if path.exists() => {
-            fs::copy(&temporary, path)?;
-            fs::remove_file(&temporary)?;
+        Err(_) if destination.exists() => {
+            fs::copy(temporary, destination)?;
+            fs::remove_file(temporary)?;
             Ok(())
         }
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
+            let _ = fs::remove_file(temporary);
             Err(StorageError::Io(error))
         }
     }
+}
+
+fn ensure_backup_destination(root: &Path, destination: &Path) -> StorageResult<()> {
+    let mut probe = destination
+        .parent()
+        .ok_or_else(|| StorageError::InvalidPath(destination.display().to_string()))?;
+    while !probe.exists() {
+        probe = probe
+            .parent()
+            .ok_or_else(|| StorageError::InvalidPath(destination.display().to_string()))?;
+    }
+    if fs::canonicalize(probe)?.starts_with(root) {
+        return Err(StorageError::InvalidPath(
+            "Backup destination must be outside the active Library".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_restore_destination(root: &Path, destination: &Path) -> StorageResult<()> {
+    if destination.exists() && fs::symlink_metadata(destination)?.file_type().is_symlink() {
+        return Err(StorageError::InvalidPath(
+            "Restore destination must not be a symlink".into(),
+        ));
+    }
+    let mut probe = if destination.exists() {
+        destination.to_owned()
+    } else {
+        destination
+            .parent()
+            .ok_or_else(|| StorageError::InvalidPath(destination.display().to_string()))?
+            .to_owned()
+    };
+    while !probe.exists() {
+        probe = probe
+            .parent()
+            .ok_or_else(|| StorageError::InvalidPath(destination.display().to_string()))?
+            .to_owned();
+    }
+    if fs::canonicalize(probe)?.starts_with(root) {
+        return Err(StorageError::InvalidPath(
+            "Restore destination must be outside the active Library".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn restore_backup_manifest(destination: &Path) -> StorageResult<()> {
+    let manifest_path = destination.join(INDEX_DIR).join("backup-manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&manifest_path)?;
+    let manifest: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| StorageError::Archive(format!("Invalid backup manifest: {error}")))?;
+    if manifest.get("format").and_then(|value| value.as_str()) != Some("cinqic-notes-backup")
+        || manifest.get("version").and_then(|value| value.as_i64()) != Some(1)
+    {
+        return Err(StorageError::Archive(
+            "Unsupported Cinqic Notes backup manifest".into(),
+        ));
+    }
+    let library = Library::open(destination)?;
+    let connection = library.connection()?;
+    let transaction = connection.unchecked_transaction()?;
+    if let Some(revisions) = manifest.get("revisions").and_then(|value| value.as_array()) {
+        for revision in revisions {
+            transaction.execute(
+                "INSERT OR IGNORE INTO revisions(id, note_path, content, hash, actor, reason, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    revision.get("id").and_then(|value| value.as_str()).ok_or_else(|| StorageError::Archive("Backup revision has no id".into()))?,
+                    revision.get("notePath").and_then(|value| value.as_str()).ok_or_else(|| StorageError::Archive("Backup revision has no note path".into()))?,
+                    revision.get("content").and_then(|value| value.as_str()).ok_or_else(|| StorageError::Archive("Backup revision has no content".into()))?,
+                    revision.get("hash").and_then(|value| value.as_str()).ok_or_else(|| StorageError::Archive("Backup revision has no hash".into()))?,
+                    revision.get("actor").and_then(|value| value.as_str()).ok_or_else(|| StorageError::Archive("Backup revision has no actor".into()))?,
+                    revision.get("reason").and_then(|value| value.as_str()).ok_or_else(|| StorageError::Archive("Backup revision has no reason".into()))?,
+                    revision.get("createdAt").and_then(|value| value.as_str()).ok_or_else(|| StorageError::Archive("Backup revision has no timestamp".into()))?,
+                ],
+            )?;
+        }
+    }
+    if let Some(settings) = manifest.get("settings").and_then(|value| value.as_object()) {
+        for (key, value) in settings {
+            if let Some(value) = value.as_str() {
+                transaction.execute(
+                    "INSERT INTO settings(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, value],
+                )?;
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn safe_archive_member(name: &str) -> StorageResult<PathBuf> {
+    let normalized = name.replace('\\', "/");
+    let candidate = Path::new(&normalized);
+    if normalized.is_empty()
+        || candidate.is_absolute()
+        || candidate.components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(StorageError::InvalidPath(format!(
+            "Unsafe archive member: {name}"
+        )));
+    }
+    let is_manifest = normalized == ".cinqic/backup-manifest.json";
+    if !is_manifest
+        && normalized
+            .split('/')
+            .any(|part| part == INDEX_DIR || part.is_empty())
+    {
+        return Err(StorageError::InvalidPath(format!(
+            "Unsafe archive member: {name}"
+        )));
+    }
+    Ok(PathBuf::from(normalized))
+}
+
+fn file_modified_at(metadata: &fs::Metadata) -> String {
+    metadata
+        .modified()
+        .map(chrono::DateTime::<Utc>::from)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|_| now())
 }
 
 fn record_revision(
@@ -1108,5 +1912,114 @@ mod tests {
         assert!(library.revisions(&restored.summary.path)?.len() >= 2);
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn archive_move_daily_notes_and_tags_stay_searchable() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let home = library.create_note("Home", NoteFormat::Markdown, "")?;
+        let project = library.create_note("Project", NoteFormat::Markdown, "")?;
+        library.update_note(
+            &home.summary.path,
+            "# Home\n\nSee [[Project]] and #planning",
+            Some(&home.summary.hash),
+            "local",
+        )?;
+        assert_eq!(library.list_tags()?[0].tag, "planning");
+        assert_eq!(library.outgoing_links(&home.summary.path)?.len(), 1);
+        assert!(library.outgoing_links(&home.summary.path)?[0].resolved);
+
+        let moved = library.move_note(&project.summary.path, "projects")?;
+        assert_eq!(moved.summary.path, "projects/Project.md");
+        assert_eq!(
+            library.search_notes("Project", false)?[0].path,
+            moved.summary.path
+        );
+
+        let archived = library.archive_note(&moved.summary.path, true)?;
+        assert!(archived.summary.archived);
+        assert!(
+            library
+                .list_notes_filtered(false, false)?
+                .iter()
+                .all(|note| !note.archived)
+        );
+        assert!(
+            library
+                .list_notes_filtered(false, true)?
+                .iter()
+                .any(|note| note.path == moved.summary.path && note.archived)
+        );
+
+        let daily = library.create_daily_note("2026-09-05")?;
+        assert_eq!(daily.summary.path, "2026-09-05.md");
+        assert!(library.create_daily_note("2026-9-5").is_err());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn attachments_recovery_backups_and_integrity_are_local_and_safe() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let note = library.create_note("Portable", NoteFormat::Markdown, "")?;
+        let updated = library.update_note(
+            &note.summary.path,
+            "# Portable\n\nUpdated",
+            Some(&note.summary.hash),
+            "local",
+        )?;
+        let source = root.parent().unwrap().join(format!(
+            "cinqic-attachment-{}-source.bin",
+            std::process::id()
+        ));
+        fs::write(&source, b"attachment bytes")?;
+        let attachment = library.import_attachment(&source.to_string_lossy())?;
+        assert_eq!(library.list_attachments()?.len(), 1);
+        assert_eq!(fs::read(root.join(&attachment.path))?, b"attachment bytes");
+
+        let draft = library.save_recovery_draft(&note.summary.path, "# recovered")?;
+        assert_eq!(library.read_recovery_draft(&draft.path)?, "# recovered");
+        assert!(library.read_recovery_draft("../draft.json").is_err());
+
+        let backup = root.parent().unwrap().join(format!(
+            "cinqic-backup-{}-{}.zip",
+            std::process::id(),
+            domain::hash_content(&root.to_string_lossy())
+        ));
+        library.backup_library(&backup.to_string_lossy(), true)?;
+        let restored_root = temp_library();
+        library.restore_backup(&backup.to_string_lossy(), &restored_root.to_string_lossy())?;
+        assert_eq!(
+            fs::read_to_string(restored_root.join("Portable.md"))?,
+            updated.content
+        );
+        assert_eq!(
+            fs::read(restored_root.join(&attachment.path))?,
+            b"attachment bytes"
+        );
+        let restored_library = Library::open(&restored_root)?;
+        assert_eq!(restored_library.revisions("Portable.md")?.len(), 1);
+        assert!(library.verify_integrity()?.ok);
+
+        library.trash_note(&note.summary.path)?;
+        assert_eq!(library.empty_trash()?, 1);
+        assert!(library.list_notes(true)?.iter().all(|item| !item.trashed));
+
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(backup);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(restored_root);
+        Ok(())
+    }
+
+    #[test]
+    fn archive_member_validation_rejects_traversal_and_internal_paths() {
+        assert!(safe_archive_member("../outside.md").is_err());
+        assert!(safe_archive_member("C:/outside.md").is_err());
+        assert!(safe_archive_member(".cinqic/index.sqlite3").is_err());
+        assert!(safe_archive_member("nested/note.md").is_ok());
+        assert!(safe_archive_member(".cinqic/backup-manifest.json").is_ok());
     }
 }

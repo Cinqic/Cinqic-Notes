@@ -1,4 +1,7 @@
-use crate::domain::{LibraryInfo, NoteDocument, NoteFormat, NoteSummary, TaskItem};
+use crate::domain::{
+    AttachmentItem, IntegrityInfo, LibraryInfo, LinkItem, NoteDocument, NoteFormat, NoteSummary,
+    RecoveryDraftInfo, TagItem, TaskItem,
+};
 use crate::storage::{Library, StorageError};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
@@ -40,6 +43,7 @@ fn watch_library(
     library: &Library,
 ) -> Result<(), String> {
     let root = library.root.clone();
+    let library = library.clone();
     let app = app.clone();
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<Event>| {
@@ -50,6 +54,9 @@ fn watch_library(
                         .any(|component| component.as_os_str().to_string_lossy() == ".cinqic")
                 });
                 if changed_outside_index {
+                    for path in &event.paths {
+                        let _ = library.reconcile_path(path);
+                    }
                     let _ = app.emit("library-changed", ());
                 }
             }
@@ -149,6 +156,17 @@ pub fn list_notes(
 }
 
 #[tauri::command]
+pub fn list_notes_filtered(
+    state: State<'_, AppState>,
+    include_trashed: bool,
+    include_archived: bool,
+) -> Result<Vec<NoteSummary>, String> {
+    current_library(&state)?
+        .list_notes_filtered(include_trashed, include_archived)
+        .map_err(failure)
+}
+
+#[tauri::command]
 pub fn search_notes(
     state: State<'_, AppState>,
     query: String,
@@ -156,6 +174,18 @@ pub fn search_notes(
 ) -> Result<Vec<NoteSummary>, String> {
     current_library(&state)?
         .search_notes(&query, include_trashed)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn search_notes_filtered(
+    state: State<'_, AppState>,
+    query: String,
+    include_trashed: bool,
+    include_archived: bool,
+) -> Result<Vec<NoteSummary>, String> {
+    current_library(&state)?
+        .search_notes_filtered(&query, include_trashed, include_archived)
         .map_err(failure)
 }
 
@@ -173,6 +203,13 @@ pub fn create_note(
 ) -> Result<NoteDocument, String> {
     current_library(&state)?
         .create_note(&title, format, &folder)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn create_daily_note(state: State<'_, AppState>, date: String) -> Result<NoteDocument, String> {
+    current_library(&state)?
+        .create_daily_note(&date)
         .map_err(failure)
 }
 
@@ -196,6 +233,28 @@ pub fn rename_note(
 ) -> Result<NoteDocument, String> {
     current_library(&state)?
         .rename_note(&path, &title)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn move_note(
+    state: State<'_, AppState>,
+    path: String,
+    folder: String,
+) -> Result<NoteDocument, String> {
+    current_library(&state)?
+        .move_note(&path, &folder)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn archive_note(
+    state: State<'_, AppState>,
+    path: String,
+    archived: bool,
+) -> Result<NoteDocument, String> {
+    current_library(&state)?
+        .archive_note(&path, archived)
         .map_err(failure)
 }
 
@@ -246,6 +305,36 @@ pub fn get_graph(state: State<'_, AppState>) -> Result<crate::domain::GraphData,
 }
 
 #[tauri::command]
+pub fn get_outgoing_links(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<LinkItem>, String> {
+    current_library(&state)?
+        .outgoing_links(&path)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagItem>, String> {
+    current_library(&state)?.list_tags().map_err(failure)
+}
+
+#[tauri::command]
+pub fn list_attachments(state: State<'_, AppState>) -> Result<Vec<AttachmentItem>, String> {
+    current_library(&state)?.list_attachments().map_err(failure)
+}
+
+#[tauri::command]
+pub fn import_attachment(
+    state: State<'_, AppState>,
+    source: String,
+) -> Result<AttachmentItem, String> {
+    current_library(&state)?
+        .import_attachment(&source)
+        .map_err(failure)
+}
+
+#[tauri::command]
 pub fn rebuild_index(state: State<'_, AppState>) -> Result<LibraryInfo, String> {
     current_library(&state)?.rebuild_index().map_err(failure)
 }
@@ -269,6 +358,70 @@ pub fn export_note(
 ) -> Result<(), String> {
     current_library(&state)?
         .export_note(&path, &destination, &format)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn backup_library(
+    state: State<'_, AppState>,
+    destination: String,
+    include_internal: bool,
+) -> Result<(), String> {
+    current_library(&state)?
+        .backup_library(&destination, include_internal)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn restore_backup(
+    state: State<'_, AppState>,
+    archive_path: String,
+    destination: String,
+) -> Result<(), String> {
+    current_library(&state)?
+        .restore_backup(&archive_path, &destination)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn empty_trash(state: State<'_, AppState>) -> Result<u64, String> {
+    current_library(&state)?.empty_trash().map_err(failure)
+}
+
+#[tauri::command]
+pub fn verify_integrity(state: State<'_, AppState>) -> Result<IntegrityInfo, String> {
+    current_library(&state)?.verify_integrity().map_err(failure)
+}
+
+#[tauri::command]
+pub fn save_recovery_draft(
+    state: State<'_, AppState>,
+    note_path: String,
+    content: String,
+) -> Result<RecoveryDraftInfo, String> {
+    current_library(&state)?
+        .save_recovery_draft(&note_path, &content)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn list_recovery_drafts(state: State<'_, AppState>) -> Result<Vec<RecoveryDraftInfo>, String> {
+    current_library(&state)?
+        .list_recovery_drafts()
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn read_recovery_draft(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    current_library(&state)?
+        .read_recovery_draft(&path)
+        .map_err(failure)
+}
+
+#[tauri::command]
+pub fn remove_recovery_draft(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    current_library(&state)?
+        .remove_recovery_draft(&path)
         .map_err(failure)
 }
 

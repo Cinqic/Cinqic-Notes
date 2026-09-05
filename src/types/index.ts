@@ -46,6 +46,39 @@ export interface BacklinkItem {
   label: string
 }
 
+export interface LinkItem {
+  sourcePath: string
+  sourceTitle: string
+  targetPath: string
+  targetTitle?: string | null
+  kind: string
+  label: string
+  resolved: boolean
+}
+
+export interface TagItem {
+  tag: string
+  noteCount: number
+}
+
+export interface AttachmentItem {
+  path: string
+  size: number
+  modifiedAt: string
+}
+
+export interface RecoveryDraftInfo {
+  path: string
+  notePath: string
+  createdAt: string
+  size: number
+}
+
+export interface IntegrityInfo {
+  ok: boolean
+  message: string
+}
+
 export interface GraphData {
   nodes: Array<{ path: string; title: string; project: boolean }>
   edges: Array<{ source: string; target: string; kind: string }>
