@@ -1705,7 +1705,12 @@ fn restore_backup_manifest(destination: &Path) -> StorageResult<()> {
 fn safe_archive_member(name: &str) -> StorageResult<PathBuf> {
     let normalized = name.replace('\\', "/");
     let candidate = Path::new(&normalized);
+    let has_windows_drive = normalized.len() >= 3
+        && normalized.as_bytes()[0].is_ascii_alphabetic()
+        && normalized.as_bytes()[1] == b':'
+        && normalized.as_bytes()[2] == b'/';
     if normalized.is_empty()
+        || has_windows_drive
         || candidate.is_absolute()
         || candidate.components().any(|part| {
             matches!(
