@@ -37,6 +37,17 @@ pnpm tauri:dev
 formatting, lint, type checking, frontend tests, schema checks, and the Rust
 format/test/clippy checks when the Rust toolchain is available.
 
+The same Notes Core can be used headlessly through the local CLI during
+development:
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --bin cinqic-notes-cli -- <Library> list
+cargo run --manifest-path src-tauri/Cargo.toml --bin cinqic-notes-cli -- <Library> search "meeting notes"
+```
+
+The CLI has no server listener and uses the same path validation, optimistic
+write, revision, and export behavior as the desktop app.
+
 ## Library format and storage
 
 A Library is an ordinary directory. Cinqic Notes writes `.md` and `.txt` files

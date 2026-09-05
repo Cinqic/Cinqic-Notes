@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
-mod domain;
-mod storage;
+pub mod domain;
+pub mod storage;
 
 use commands::AppState;
 
