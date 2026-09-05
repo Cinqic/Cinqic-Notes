@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.idea/
+.vscode/
+*.swp
+*.db
+*.db-shm
+*.db-wal
+.cinqic/
+release-artifacts/

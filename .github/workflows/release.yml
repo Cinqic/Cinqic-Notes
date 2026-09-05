@@ -1,0 +1,76 @@
+name: Cinqic Notes development release
+
+on:
+  push:
+    tags:
+      - 'v0.1.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build verified desktop artifacts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: msi
+          - os: ubuntu-22.04
+            bundles: deb,appimage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.19.0'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+      - name: Install Linux prerequisites
+        if: matrix.os == 'ubuntu-22.04'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev
+          libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri build --bundles ${{ matrix.bundles }} -- --locked
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          find src-tauri/target/release/bundle -type f \( -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) -exec cp {} release-artifacts/ \;
+          test -n "$(find release-artifacts -type f -print -quit)"
+          (cd release-artifacts && sha256sum $(find . -maxdepth 1 -type f \( -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) -printf '%f\n') > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cinqic-notes-${{ matrix.os }}
+          path: release-artifacts
+          if-no-files-found: error
+
+  publish:
+    name: Publish checksummed development release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cinqic-notes-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: Verify checksums
+        run: |
+          find release-artifacts -type f \( -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) -print
+          test "$(find release-artifacts -type f \( -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) | wc -l)" -ge 2
+          (cd release-artifacts && sha256sum $(find . -type f \( -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) -printf '%p\n') > SHA256SUMS.txt && sha256sum --check SHA256SUMS.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Cinqic Notes ${{ github.ref_name }}
+          prerelease: true
+          generate_release_notes: true
+          files: release-artifacts/*
