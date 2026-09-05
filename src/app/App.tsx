@@ -14,6 +14,7 @@ import type {
   RecoveryDraftInfo,
   RevisionItem,
   SaveState,
+  TagItem,
   TaskItem,
 } from '../types'
 
@@ -154,6 +155,9 @@ function NotesWorkspace({
   const [content, setContent] = useState('')
   const [titleDraft, setTitleDraft] = useState('')
   const [query, setQuery] = useState('')
+  const [tagFilter, setTagFilter] = useState('')
+  const [formatFilter, setFormatFilter] = useState<'all' | 'markdown' | 'text'>('all')
+  const [taskFilter, setTaskFilter] = useState<'all' | 'tasks' | 'open'>('all')
   const [view, setView] = useState<View>('all')
   const [saveState, setSaveState] = useState<SaveState>('saved')
   const [message, setMessage] = useState('')
@@ -168,6 +172,7 @@ function NotesWorkspace({
   const [outgoingLinks, setOutgoingLinks] = useState<LinkItem[]>([])
   const [revisions, setRevisions] = useState<RevisionItem[]>([])
   const [tasks, setTasks] = useState<TaskItem[]>([])
+  const [tags, setTags] = useState<TagItem[]>([])
   const [graph, setGraph] = useState<GraphData | null>(null)
   const [conflict, setConflict] = useState<ConflictInfo | null>(null)
   const editorRef = useRef<HTMLTextAreaElement>(null)
@@ -229,6 +234,10 @@ function NotesWorkspace({
 
   useEffect(() => {
     void refresh()
+    void notesApi
+      .listTags()
+      .then(setTags)
+      .catch(() => setTags([]))
   }, [refresh])
 
   useEffect(() => {
@@ -316,6 +325,21 @@ function NotesWorkspace({
       setOutgoingLinks([])
       setMessage('New note')
       window.setTimeout(() => editorRef.current?.focus(), 50)
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
+  const createMissingLink = async (targetPath: string) => {
+    const segments = targetPath.split('/').filter(Boolean)
+    const fileName = segments.pop() || 'Untitled.md'
+    const title = fileName.replace(/\.(md|txt)$/i, '') || 'Untitled'
+    try {
+      const doc = await notesApi.createNote(title, 'markdown', segments.join('/'))
+      setView('all')
+      await selectNote(doc.path)
+      await refresh(doc.path)
+      setMessage('Linked note created')
     } catch (nextError: unknown) {
       setError(displayError(nextError))
     }
@@ -530,6 +554,9 @@ function NotesWorkspace({
   const selectView = (nextView: View) => {
     setView(nextView)
     setQuery('')
+    setTagFilter('')
+    setFormatFilter('all')
+    setTaskFilter('all')
     setError('')
     if (nextView === 'settings') setShowSettings(true)
     if (
@@ -583,14 +610,19 @@ function NotesWorkspace({
   })
 
   const filteredNotes = useMemo(() => {
+    let result = notes
     if (view === 'today') {
       const today = new Date().toDateString()
-      return notes.filter((note) => new Date(note.modifiedAt).toDateString() === today)
+      result = result.filter((note) => new Date(note.modifiedAt).toDateString() === today)
     }
-    if (view === 'projects') return notes.filter((note) => note.project)
-    if (view === 'archive') return notes.filter((note) => note.archived)
-    return notes
-  }, [notes, view])
+    if (view === 'projects') result = result.filter((note) => note.project)
+    if (view === 'archive') result = result.filter((note) => note.archived)
+    if (tagFilter) result = result.filter((note) => note.tags.includes(tagFilter))
+    if (formatFilter !== 'all') result = result.filter((note) => note.format === formatFilter)
+    if (taskFilter === 'tasks') result = result.filter((note) => note.taskCount > 0)
+    if (taskFilter === 'open') result = result.filter((note) => note.openTaskCount > 0)
+    return result
+  }, [formatFilter, notes, tagFilter, taskFilter, view])
 
   const saveLabel =
     saveState === 'saved'
@@ -826,8 +858,15 @@ function NotesWorkspace({
             {showList && (
               <NoteList
                 notes={filteredNotes}
+                tags={tags}
                 activePath={activeDocument?.path}
                 query={query}
+                tagFilter={tagFilter}
+                setTagFilter={setTagFilter}
+                formatFilter={formatFilter}
+                setFormatFilter={setFormatFilter}
+                taskFilter={taskFilter}
+                setTaskFilter={setTaskFilter}
                 setQuery={(next) => {
                   setQuery(next)
                   void loadNotes(next, view === 'trash')
@@ -861,6 +900,7 @@ function NotesWorkspace({
                 setView('all')
                 void selectNote(path)
               }}
+              onCreateLink={(path) => void createMissingLink(path)}
               error={error}
               message={message}
               editorRef={editorRef}
@@ -901,6 +941,12 @@ function NotesWorkspace({
                 } catch (nextError: unknown) {
                   setError(displayError(nextError))
                 }
+              }}
+              onCopyRevision={(revision) => {
+                void navigator.clipboard
+                  ?.writeText(revision.content)
+                  .then(() => setMessage('Revision copied'))
+                  .catch((nextError: unknown) => setError(displayError(nextError)))
               }}
             />
           </div>
@@ -958,16 +1004,30 @@ function NavItem({
 
 function NoteList({
   notes,
+  tags,
   activePath,
   query,
+  tagFilter,
+  setTagFilter,
+  formatFilter,
+  setFormatFilter,
+  taskFilter,
+  setTaskFilter,
   setQuery,
   onSelect,
   onImport,
   view,
 }: {
   notes: NoteSummary[]
+  tags: TagItem[]
   activePath?: string
   query: string
+  tagFilter: string
+  setTagFilter: (value: string) => void
+  formatFilter: 'all' | 'markdown' | 'text'
+  setFormatFilter: (value: 'all' | 'markdown' | 'text') => void
+  taskFilter: 'all' | 'tasks' | 'open'
+  setTaskFilter: (value: 'all' | 'tasks' | 'open') => void
   setQuery: (value: string) => void
   onSelect: (path: string) => void
   onImport: () => void
@@ -1005,6 +1065,41 @@ function NoteList({
         />
         <kbd>⌘ K</kbd>
       </label>
+      <div className="note-filters" aria-label="Note filters">
+        <label>
+          <span>Tag</span>
+          <select value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}>
+            <option value="">All tags</option>
+            {tags.map((tag) => (
+              <option key={tag.tag} value={tag.tag}>
+                #{tag.tag} ({tag.noteCount})
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Type</span>
+          <select
+            value={formatFilter}
+            onChange={(event) => setFormatFilter(event.target.value as 'all' | 'markdown' | 'text')}
+          >
+            <option value="all">All types</option>
+            <option value="markdown">Markdown</option>
+            <option value="text">Plain text</option>
+          </select>
+        </label>
+        <label>
+          <span>Tasks</span>
+          <select
+            value={taskFilter}
+            onChange={(event) => setTaskFilter(event.target.value as 'all' | 'tasks' | 'open')}
+          >
+            <option value="all">Any tasks</option>
+            <option value="tasks">Has tasks</option>
+            <option value="open">Has open tasks</option>
+          </select>
+        </label>
+      </div>
       <div className="note-list">
         {notes.map((note) => (
           <button
@@ -1118,6 +1213,7 @@ function EditorPane({
   backlinks,
   outgoingLinks,
   onOpenLink,
+  onCreateLink,
   error,
   message,
   editorRef,
@@ -1125,6 +1221,7 @@ function EditorPane({
   onResolveConflict,
   revisions,
   onRestoreRevision,
+  onCopyRevision,
 }: {
   document: NoteDocument | null
   content: string
@@ -1143,6 +1240,7 @@ function EditorPane({
   backlinks: BacklinkItem[]
   outgoingLinks: LinkItem[]
   onOpenLink: (path: string) => void
+  onCreateLink: (path: string) => void
   error: string
   message: string
   editorRef: React.RefObject<HTMLTextAreaElement | null>
@@ -1150,6 +1248,7 @@ function EditorPane({
   onResolveConflict: (resolution: 'local' | 'disk') => void
   revisions: RevisionItem[]
   onRestoreRevision: (revisionId: string) => Promise<void>
+  onCopyRevision: (revision: RevisionItem) => void
 }) {
   const [showMeta, setShowMeta] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
@@ -1235,7 +1334,13 @@ function EditorPane({
           </div>
         )}
         {conflict && <ConflictBanner conflict={conflict} onResolve={onResolveConflict} />}
-        {showHistory && <RevisionPanel revisions={revisions} onRestore={onRestoreRevision} />}
+        {showHistory && (
+          <RevisionPanel
+            revisions={revisions}
+            onRestore={onRestoreRevision}
+            onCopy={onCopyRevision}
+          />
+        )}
         {showPreview ? (
           <article
             className="markdown-preview"
@@ -1278,21 +1383,30 @@ function EditorPane({
               OUTGOING LINKS <span>{outgoingLinks.length}</span>
             </div>
             {outgoingLinks.map((link) => (
-              <button
-                key={link.targetPath + '-' + link.label}
-                className="backlink-item"
-                disabled={!link.resolved}
-                onClick={() => link.resolved && onOpenLink(link.targetPath)}
-              >
-                <span>{link.resolved ? '↘' : '?'}</span>
-                <span>
-                  <strong>{link.targetTitle || link.targetPath}</strong>
-                  <small>
-                    {link.label}
-                    {link.resolved ? '' : ' · unresolved'}
-                  </small>
-                </span>
-              </button>
+              <div className="outgoing-link-row" key={link.targetPath + '-' + link.label}>
+                <button
+                  className="backlink-item"
+                  disabled={!link.resolved}
+                  onClick={() => link.resolved && onOpenLink(link.targetPath)}
+                >
+                  <span>{link.resolved ? '↘' : '?'}</span>
+                  <span>
+                    <strong>{link.targetTitle || link.targetPath}</strong>
+                    <small>
+                      {link.label}
+                      {link.resolved ? '' : ' · unresolved'}
+                    </small>
+                  </span>
+                </button>
+                {!link.resolved && (
+                  <button
+                    className="button quiet small link-create-button"
+                    onClick={() => onCreateLink(link.targetPath)}
+                  >
+                    Create note
+                  </button>
+                )}
+              </div>
             ))}
           </div>
         )}
@@ -1304,9 +1418,11 @@ function EditorPane({
 function RevisionPanel({
   revisions,
   onRestore,
+  onCopy,
 }: {
   revisions: RevisionItem[]
   onRestore: (revisionId: string) => Promise<void>
+  onCopy: (revision: RevisionItem) => void
 }) {
   return (
     <div className="revision-panel">
@@ -1323,9 +1439,21 @@ function RevisionPanel({
                 {revision.content.split(/\r?\n/).length} lines
               </small>
             </div>
-            <button className="button secondary small" onClick={() => void onRestore(revision.id)}>
-              Restore
-            </button>
+            <div className="revision-actions">
+              <details className="revision-preview">
+                <summary>View</summary>
+                <pre>{revision.content}</pre>
+              </details>
+              <button className="button quiet small" onClick={() => onCopy(revision)}>
+                Copy
+              </button>
+              <button
+                className="button secondary small"
+                onClick={() => void onRestore(revision.id)}
+              >
+                Restore
+              </button>
+            </div>
           </div>
         ))
       ) : (
@@ -1375,6 +1503,10 @@ function TasksView({
   onToggle: (task: TaskItem) => void
   onOpen: (path: string) => void
 }) {
+  const [filter, setFilter] = useState<'all' | 'open' | 'complete'>('all')
+  const visibleTasks = tasks.filter(
+    (task) => filter === 'all' || (filter === 'open' ? !task.checked : task.checked),
+  )
   return (
     <section className="utility-view">
       <div className="utility-heading">
@@ -1383,12 +1515,27 @@ function TasksView({
         <p>Checklists stay in the note that owns them.</p>
       </div>
       <div className="task-filters">
-        <span className="filter-chip active">All {tasks.length}</span>
-        <span className="filter-chip">Open {tasks.filter((task) => !task.checked).length}</span>
-        <span className="filter-chip">Complete {tasks.filter((task) => task.checked).length}</span>
+        <button
+          className={`filter-chip ${filter === 'all' ? 'active' : ''}`}
+          onClick={() => setFilter('all')}
+        >
+          All {tasks.length}
+        </button>
+        <button
+          className={`filter-chip ${filter === 'open' ? 'active' : ''}`}
+          onClick={() => setFilter('open')}
+        >
+          Open {tasks.filter((task) => !task.checked).length}
+        </button>
+        <button
+          className={`filter-chip ${filter === 'complete' ? 'active' : ''}`}
+          onClick={() => setFilter('complete')}
+        >
+          Complete {tasks.filter((task) => task.checked).length}
+        </button>
       </div>
       <div className="task-table">
-        {tasks.map((task) => (
+        {visibleTasks.map((task) => (
           <div className={`task-row ${task.checked ? 'complete' : ''}`} key={task.id}>
             <button
               className="task-checkbox"
@@ -1403,11 +1550,13 @@ function TasksView({
             </button>
           </div>
         ))}
-        {!tasks.length && (
+        {!visibleTasks.length && (
           <div className="empty-utility">
             <span>☑</span>
-            <p>No checklist items yet.</p>
-            <small>Use `- [ ]` in any Markdown note.</small>
+            <p>{tasks.length ? 'No tasks in this filter.' : 'No checklist items yet.'}</p>
+            <small>
+              {tasks.length ? 'Choose another task filter.' : 'Use `- [ ]` in any Markdown note.'}
+            </small>
           </div>
         )}
       </div>
@@ -1700,6 +1849,18 @@ function ShareDialog({
     setCopied(kind === 'markdown' ? 'Markdown copied' : 'Plain text copied')
     window.setTimeout(() => setCopied(''), 1800)
   }
+  const share = async () => {
+    if (!navigator.share) {
+      setCopied('Platform sharing is unavailable here')
+      return
+    }
+    try {
+      await navigator.share({ title: document.title, text: content })
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      setCopied('Platform sharing failed')
+    }
+  }
   return (
     <div
       className="modal-backdrop"
@@ -1721,6 +1882,13 @@ function ShareDialog({
           Keep this note portable. Cinqic Notes never needs to upload it.
         </p>
         <div className="share-options">
+          {'share' in navigator && (
+            <button onClick={() => void share()}>
+              <span>↗</span>
+              <strong>Share with another app</strong>
+              <small>Use the device share sheet when supported</small>
+            </button>
+          )}
           <button onClick={() => void copy('markdown')}>
             <span>⌘</span>
             <strong>Copy Markdown</strong>
@@ -1745,6 +1913,11 @@ function ShareDialog({
             <span>◇</span>
             <strong>Export safe HTML</strong>
             <small>A standalone, offline file</small>
+          </button>
+          <button onClick={() => window.print()}>
+            <span>▣</span>
+            <strong>Print</strong>
+            <small>Print the current note through the platform</small>
           </button>
         </div>
         {copied && (

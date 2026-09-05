@@ -437,6 +437,34 @@ textarea:focus-visible {
   color: var(--faint);
   font-size: 9px;
 }
+.note-filters {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  padding: 0 0 10px;
+}
+.note-filters label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.note-filters label > span {
+  padding-left: 2px;
+  color: var(--faint);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.note-filters select {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 9px;
+}
 .note-list {
   overflow: auto;
 }
@@ -783,6 +811,23 @@ textarea:focus-visible {
   font-size: 12px;
   text-align: left;
 }
+.outgoing-link-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.outgoing-link-row .backlink-item {
+  flex: 1;
+  min-width: 0;
+}
+.link-create-button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  color: var(--accent-dark);
+  white-space: nowrap;
+}
 .backlink-item:not(:disabled):hover strong {
   color: var(--accent-dark);
   text-decoration: underline;
@@ -890,6 +935,41 @@ textarea:focus-visible {
   color: var(--muted);
   font-size: 10px;
 }
+.revision-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+}
+.revision-preview {
+  position: relative;
+}
+.revision-preview summary {
+  padding: 7px 8px;
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+.revision-preview pre {
+  position: absolute;
+  z-index: 2;
+  top: 30px;
+  right: 0;
+  width: min(70vw, 420px);
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font:
+    11px/1.55 ui-monospace,
+    monospace;
+  white-space: pre-wrap;
+  box-shadow: var(--shadow-soft);
+}
 .muted-copy {
   line-height: 1.5;
 }
@@ -951,6 +1031,7 @@ textarea:focus-visible {
   margin: 33px 0 14px;
 }
 .filter-chip {
+  background: transparent;
   padding: 7px 10px;
   border: 1px solid var(--line);
   border-radius: 20px;
@@ -1326,6 +1407,9 @@ textarea:focus-visible {
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
+  .note-filters {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
   .document-wrap {
     padding-top: 34px;
   }
@@ -1364,5 +1448,38 @@ textarea:focus-visible {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
+  }
+}
+@media print {
+  .sidebar,
+  .topbar,
+  .editor-toolbar,
+  .backlinks,
+  .toast-message,
+  .inline-alert,
+  .conflict-banner {
+    display: none !important;
+  }
+  .app-frame,
+  .main-pane,
+  .editor-pane {
+    display: block;
+    min-height: auto;
+    background: #fff;
+  }
+  .document-wrap {
+    width: 100%;
+    max-width: none;
+    padding: 0;
+  }
+  .document-title,
+  .markdown-preview,
+  .document-editor {
+    color: #000;
+  }
+  .document-editor {
+    min-height: auto;
+    overflow: visible;
+    resize: none;
   }
 }

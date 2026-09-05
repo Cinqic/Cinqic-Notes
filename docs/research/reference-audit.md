@@ -2,7 +2,9 @@
 
 Before choosing the Notes architecture, the current working trees for
 `Cinqic/Juniper-App`, `Cinqic/Cinqic-Calculator`, and `Cinqic/cinqic.com` were
-reviewed under `research/source-repos/`.
+reviewed during the foundation audit. Their source trees are not vendored into
+this repository; this document records the implementation-relevant conclusions
+without copying unrelated application code.
 
 ## Reused patterns
 

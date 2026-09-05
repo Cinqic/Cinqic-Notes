@@ -11,6 +11,9 @@ SQLite index provides fast local search, links, backlinks, and tasks.
 - Autosave is local and debounced, with revisions and optimistic conflict checks.
 - `[[Wiki Links]]`, Markdown links, tags, projects, checklists, and local export
   are supported without a network connection.
+- The note list can narrow results by tag, document type, or task state; local
+  revisions can be viewed/copied/restored; sharing includes copy, export, print,
+  and the device share sheet when the platform provides one.
 - Juniper integration is a documented future contract, disabled by default.
 
 This is an early development milestone (`0.1.0`). It is not a collaboration or

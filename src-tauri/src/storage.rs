@@ -1192,8 +1192,10 @@ impl Library {
     }
 
     fn safe_relative(&self, path: &str) -> StorageResult<String> {
-        let candidate = Path::new(path);
-        if candidate.is_absolute()
+        let normalized = path.replace('\\', "/");
+        let candidate = Path::new(&normalized);
+        if has_windows_path_prefix(&normalized)
+            || candidate.is_absolute()
             || candidate.components().any(|part| {
                 matches!(
                     part,
@@ -1203,7 +1205,6 @@ impl Library {
         {
             return Err(StorageError::InvalidPath(path.into()));
         }
-        let normalized = candidate.to_string_lossy().replace('\\', "/");
         if normalized.is_empty()
             || normalized.starts_with('.')
             || normalized.contains("/.cinqic")
@@ -1705,12 +1706,8 @@ fn restore_backup_manifest(destination: &Path) -> StorageResult<()> {
 fn safe_archive_member(name: &str) -> StorageResult<PathBuf> {
     let normalized = name.replace('\\', "/");
     let candidate = Path::new(&normalized);
-    let has_windows_drive = normalized.len() >= 3
-        && normalized.as_bytes()[0].is_ascii_alphabetic()
-        && normalized.as_bytes()[1] == b':'
-        && normalized.as_bytes()[2] == b'/';
     if normalized.is_empty()
-        || has_windows_drive
+        || has_windows_path_prefix(&normalized)
         || candidate.is_absolute()
         || candidate.components().any(|part| {
             matches!(
@@ -1742,6 +1739,13 @@ fn file_modified_at(metadata: &fs::Metadata) -> String {
         .map(chrono::DateTime::<Utc>::from)
         .map(|value| value.to_rfc3339())
         .unwrap_or_else(|_| now())
+}
+
+fn has_windows_path_prefix(value: &str) -> bool {
+    value.starts_with("//")
+        || (value.len() >= 2
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':')
 }
 
 fn record_revision(
@@ -1863,6 +1867,8 @@ mod tests {
         let library = Library::create(&root)?;
         assert!(library.get_note("../secret.md").is_err());
         assert!(library.get_note("C:\\secret.md").is_err());
+        assert!(library.safe_relative("C:/secret.md").is_err());
+        assert!(library.safe_relative("//server/share.md").is_err());
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
