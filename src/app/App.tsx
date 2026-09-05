@@ -245,6 +245,10 @@ function NotesWorkspace({
     let unlisten: (() => void) | undefined
     void listen('library-changed', () => {
       void loadNotes(query, view === 'trash')
+      void notesApi
+        .listTags()
+        .then(setTags)
+        .catch(() => undefined)
     }).then((dispose) => {
       unlisten = dispose
     })
@@ -551,6 +555,40 @@ function NotesWorkspace({
     }
   }
 
+  const changeLibrary = async () => {
+    if (saveState === 'dirty' && !(await forceSave())) return
+    try {
+      const chosen = await open({ directory: true, multiple: false })
+      const path = Array.isArray(chosen) ? chosen[0] : chosen
+      if (!path || path === library.path) return
+      const nextLibrary = await notesApi.openLibrary(path)
+      await notesApi.setLastLibrary(path)
+      setLibrary(nextLibrary)
+      setActiveDocument(null)
+      setContent('')
+      setTitleDraft('')
+      setNotes([])
+      setBacklinks([])
+      setOutgoingLinks([])
+      setRevisions([])
+      setConflict(null)
+      setView('all')
+      setQuery('')
+      setTagFilter('')
+      setFormatFilter('all')
+      setTaskFilter('all')
+      const [nextNotes, nextTags] = await Promise.all([
+        notesApi.listNotesFiltered(false, false),
+        notesApi.listTags(),
+      ])
+      setNotes(nextNotes)
+      setTags(nextTags)
+      setMessage('Library changed')
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
   const selectView = (nextView: View) => {
     setView(nextView)
     setQuery('')
@@ -845,6 +883,7 @@ function NotesWorkspace({
             setTheme={setTheme}
             library={library}
             onBackup={exportBackupWithMode}
+            onChangeLibrary={changeLibrary}
             onRecoverDraft={recoverDraft}
             onRebuild={async () => {
               const next = await notesApi.rebuildIndex()
@@ -1130,14 +1169,18 @@ function NoteList({
             <p>
               {query
                 ? 'No notes match that search.'
-                : view === 'trash'
-                  ? 'Trash is empty.'
-                  : 'No notes yet.'}
+                : tagFilter || formatFilter !== 'all' || taskFilter !== 'all'
+                  ? 'No notes match these filters.'
+                  : view === 'trash'
+                    ? 'Trash is empty.'
+                    : 'No notes yet.'}
             </p>
             <small>
               {query
                 ? 'Try a different word or phrase.'
-                : 'Create a note or import a Markdown folder.'}
+                : tagFilter || formatFilter !== 'all' || taskFilter !== 'all'
+                  ? 'Try clearing one of the filters.'
+                  : 'Create a note or import a Markdown folder.'}
             </small>
           </div>
         )}
@@ -1616,6 +1659,7 @@ function SettingsView({
   setTheme,
   library,
   onBackup,
+  onChangeLibrary,
   onRecoverDraft,
   onRebuild,
 }: {
@@ -1623,6 +1667,7 @@ function SettingsView({
   setTheme: (value: Theme) => void
   library: LibraryInfo
   onBackup: (includeInternal: boolean) => Promise<void>
+  onChangeLibrary: () => Promise<void>
   onRecoverDraft: (draft: RecoveryDraftInfo) => Promise<void>
   onRebuild: () => Promise<void>
 }) {
@@ -1714,6 +1759,13 @@ function SettingsView({
             </div>
           </div>
           <div className="setting-actions">
+            <button
+              className="button secondary small"
+              disabled={working}
+              onClick={() => void onChangeLibrary()}
+            >
+              Change folder…
+            </button>
             <button
               className="button secondary small"
               disabled={working}

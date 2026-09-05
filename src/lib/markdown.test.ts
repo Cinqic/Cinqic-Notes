@@ -23,6 +23,17 @@ describe('safe Markdown preview', () => {
   it('keeps plain text readable', () => {
     expect(renderSafeMarkdown('one\ntwo', 'text')).toBe('<p>one<br />two</p>')
   })
+
+  it('renders ordered lists, tables, and local links without making them executable', () => {
+    const html = renderSafeMarkdown(
+      '1. First\n2. Second\n\n| Name | State |\n| --- | --- |\n| Cinqic | local |\n\n[Note](Notes/Note.md)',
+      'markdown',
+    )
+    expect(html).toContain('<ol><li>First</li><li>Second</li></ol>')
+    expect(html).toContain('<table><thead><tr><th>Name</th><th>State</th></tr>')
+    expect(html).toContain('<span class="wiki-link">Note</span>')
+    expect(html).not.toContain('href=')
+  })
 })
 
 describe('relative dates', () => {

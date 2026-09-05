@@ -685,7 +685,7 @@ textarea:focus-visible {
   outline: 0;
   background: transparent;
   color: var(--ink);
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: Georgia, 'Times New Roman', serif;
   font-size: 14px;
   line-height: 1.8;
 }
@@ -742,6 +742,22 @@ textarea:focus-visible {
   font-family: ui-monospace, monospace;
   font-size: 12px;
   line-height: 1.55;
+}
+.markdown-preview table {
+  width: 100%;
+  margin: 1em 0;
+  border-collapse: collapse;
+  font-size: 0.9em;
+}
+.markdown-preview th,
+.markdown-preview td {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  text-align: left;
+}
+.markdown-preview th {
+  background: var(--surface-alt);
+  font-weight: 650;
 }
 .markdown-preview blockquote {
   margin: 1em 0;

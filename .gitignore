@@ -10,3 +10,4 @@ src-tauri/gen/
 *.db-wal
 .cinqic/
 release-artifacts/
+benchmarks/generated/

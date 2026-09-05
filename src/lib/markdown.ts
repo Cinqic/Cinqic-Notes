@@ -15,7 +15,16 @@ const inline = (value: string) =>
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
     .replace(/_([^_]+)_/g, '<em>$1</em>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" rel="noreferrer">$1</a>')
+    .replace(/\[([^\]]+)\]\((?!https?:\/\/)[^)]+\)/g, '<span class="wiki-link">$1</span>')
     .replace(/\[\[([^\]]+)\]\]/g, '<span class="wiki-link">$1</span>')
+
+const tableCells = (value: string) => {
+  const trimmed = value.trim().replace(/^\|/, '').replace(/\|$/, '')
+  return trimmed.split('|').map((cell) => cell.trim())
+}
+
+const isTableDivider = (value: string) =>
+  tableCells(value).length > 0 && tableCells(value).every((cell) => /^:?-{3,}:?$/.test(cell))
 
 /**
  * A deliberately small, escaped preview renderer. Raw HTML and remote images
@@ -28,16 +37,17 @@ export const renderSafeMarkdown = (source: string, format: 'markdown' | 'text') 
   const html: string[] = []
   let inCode = false
   let codeLines: string[] = []
-  let inList = false
+  let listTag: 'ul' | 'ol' | null = null
 
   const closeList = () => {
-    if (inList) {
-      html.push('</ul>')
-      inList = false
+    if (listTag) {
+      html.push(`</${listTag}>`)
+      listTag = null
     }
   }
 
-  for (const rawLine of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index]
     const escaped = escapeHtml(rawLine)
     if (escaped.trim().startsWith('```')) {
       if (inCode) {
@@ -56,6 +66,25 @@ export const renderSafeMarkdown = (source: string, format: 'markdown' | 'text') 
       closeList()
       continue
     }
+    if (lines[index + 1] && rawLine.includes('|') && isTableDivider(lines[index + 1])) {
+      closeList()
+      const headers = tableCells(escaped)
+      html.push('<table><thead><tr>')
+      headers.forEach((cell) => html.push(`<th>${inline(cell)}</th>`))
+      html.push('</tr></thead><tbody>')
+      index += 2
+      while (index < lines.length && lines[index].includes('|')) {
+        html.push('<tr>')
+        tableCells(escapeHtml(lines[index])).forEach((cell) =>
+          html.push(`<td>${inline(cell)}</td>`),
+        )
+        html.push('</tr>')
+        index += 1
+      }
+      html.push('</tbody></table>')
+      index -= 1
+      continue
+    }
     const heading = escaped.match(/^(#{1,6})\s+(.+)$/)
     if (heading) {
       closeList()
@@ -64,9 +93,10 @@ export const renderSafeMarkdown = (source: string, format: 'markdown' | 'text') 
       continue
     }
     if (/^[-*+]\s+\[[ xX]\]\s+/.test(escaped)) {
-      if (!inList) {
+      if (listTag !== 'ul') {
+        closeList()
         html.push('<ul class="task-list">')
-        inList = true
+        listTag = 'ul'
       }
       const task = escaped.replace(/^[-*+]\s+\[([ xX])\]\s+/, '$1')
       html.push(
@@ -75,11 +105,21 @@ export const renderSafeMarkdown = (source: string, format: 'markdown' | 'text') 
       continue
     }
     if (/^[-*+]\s+/.test(escaped)) {
-      if (!inList) {
+      if (listTag !== 'ul') {
+        closeList()
         html.push('<ul>')
-        inList = true
+        listTag = 'ul'
       }
       html.push(`<li>${inline(escaped.replace(/^[-*+]\s+/, ''))}</li>`)
+      continue
+    }
+    if (/^\d+[.)]\s+/.test(escaped)) {
+      if (listTag !== 'ol') {
+        closeList()
+        html.push('<ol>')
+        listTag = 'ol'
+      }
+      html.push(`<li>${inline(escaped.replace(/^\d+[.)]\s+/, ''))}</li>`)
       continue
     }
     if (/^>\s?/.test(escaped)) {
