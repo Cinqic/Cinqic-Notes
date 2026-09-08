@@ -307,14 +307,7 @@ impl Library {
 
     pub fn create_daily_note(&self, date: &str) -> StorageResult<NoteDocument> {
         let date = date.trim();
-        if date.len() != 10
-            || date.as_bytes().get(4) != Some(&b'-')
-            || date.as_bytes().get(7) != Some(&b'-')
-            || !date
-                .bytes()
-                .enumerate()
-                .all(|(index, value)| matches!(index, 4 | 7) || value.is_ascii_digit())
-        {
+        if !is_calendar_date(date) {
             return Err(StorageError::InvalidPath("Invalid daily note date".into()));
         }
         let path = format!("{date}.md");
@@ -366,9 +359,11 @@ impl Library {
             "UPDATE trash SET original_path = ?1 WHERE original_path = ?2",
             params![new_relative, old_relative],
         )?;
+        migrate_note_metadata(&transaction, &old_relative, &new_relative)?;
         resolve_links(&transaction)?;
         transaction.commit()?;
         drop(connection);
+        self.migrate_recovery_drafts(&old_relative, &new_relative)?;
         self.get_note(&new_relative)
     }
 
@@ -466,6 +461,9 @@ impl Library {
         let connection = self.connection()?;
         connection.execute("DELETE FROM conflicts WHERE path = ?1", params![relative])?;
         drop(connection);
+        // The note is now durable, so the interim recovery drafts for it are
+        // just copies of the user's text sitting in `.cinqic/recovery/`.
+        self.clear_recovery_drafts(&relative)?;
         self.get_note(path)
     }
 
@@ -494,20 +492,24 @@ impl Library {
         let old_relative = relative_path(&self.root, &absolute)?;
         let new_relative = relative_path(&self.root, &target)?;
         let connection = self.connection()?;
-        connection.execute(
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
             "UPDATE notes SET path = ?1, updated_at = ?2 WHERE path = ?3",
             params![new_relative, now(), old_relative],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE notes_fts SET path = ?1 WHERE note_id = (SELECT id FROM notes WHERE path = ?1)",
             params![new_relative],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE trash SET original_path = ?1 WHERE original_path = ?2",
             params![new_relative, old_relative],
         )?;
-        resolve_links(&connection)?;
+        migrate_note_metadata(&transaction, &old_relative, &new_relative)?;
+        resolve_links(&transaction)?;
+        transaction.commit()?;
         drop(connection);
+        self.migrate_recovery_drafts(&old_relative, &new_relative)?;
         self.get_note(&new_relative)
     }
 
@@ -517,14 +519,6 @@ impl Library {
         let content = fs::read_to_string(&absolute)?;
         let connection = self.connection()?;
         let summary = self.summary_by_path(&connection, &relative)?;
-        record_revision(
-            &connection,
-            &relative,
-            &content,
-            &summary.hash,
-            "local",
-            "before trash",
-        )?;
         let trash_name = format!(
             "{}__{}",
             Uuid::new_v4(),
@@ -534,9 +528,28 @@ impl Library {
                 .unwrap_or("note")
         );
         let trash_path = self.root.join(INDEX_DIR).join("trash").join(trash_name);
+        fs::create_dir_all(self.root.join(INDEX_DIR).join("trash"))?;
+
+        // Stage every database change first, then move the file, and undo the
+        // move if the commit fails. Moving the file before recording where it
+        // went could leave a note sitting in `.cinqic/trash/` with no row to
+        // restore it from, which the user has no way to recover through the app.
+        let transaction = connection.unchecked_transaction()?;
+        record_revision(
+            &transaction,
+            &relative,
+            &content,
+            &summary.hash,
+            "local",
+            "before trash",
+        )?;
+        transaction.execute("INSERT INTO trash(id, original_path, trash_path, title, format, hash, project, removed_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![summary.id, relative, trash_path.to_string_lossy(), summary.title, format_to_db(&summary.format), summary.hash, summary.project, now()])?;
+        remove_note_rows(&transaction, &summary.id)?;
         fs::rename(&absolute, &trash_path)?;
-        connection.execute("INSERT INTO trash(id, original_path, trash_path, title, format, hash, project, removed_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![summary.id, relative, trash_path.to_string_lossy(), summary.title, format_to_db(&summary.format), summary.hash, summary.project, now()])?;
-        remove_note_rows(&connection, &summary.id)?;
+        if let Err(error) = transaction.commit() {
+            let _ = fs::rename(&trash_path, &absolute);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -975,6 +988,62 @@ impl Library {
         })
     }
 
+    /// Rewrite the note path recorded inside recovery drafts after a rename or
+    /// move, so a draft stays associated with the note it belongs to.
+    fn migrate_recovery_drafts(&self, old: &str, new: &str) -> StorageResult<()> {
+        if old == new {
+            return Ok(());
+        }
+        self.each_recovery_draft(old, |path, mut value| {
+            value["notePath"] = serde_json::Value::String(new.to_owned());
+            let encoded = serde_json::to_string(&value).map_err(|error| {
+                StorageError::Message(format!("Could not encode recovery draft: {error}"))
+            })?;
+            atomic_write(path, &encoded)
+        })
+    }
+
+    /// Drop recovery drafts for a note whose content is now safely on disk.
+    ///
+    /// Only ever called *after* a canonical write has succeeded, so this never
+    /// removes the sole copy of unsaved work.
+    fn clear_recovery_drafts(&self, note_path: &str) -> StorageResult<()> {
+        self.each_recovery_draft(note_path, |path, _| {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn each_recovery_draft(
+        &self,
+        note_path: &str,
+        mut action: impl FnMut(&Path, serde_json::Value) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        let directory = self.root.join(INDEX_DIR).join("recovery");
+        if !directory.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            if value.get("notePath").and_then(|value| value.as_str()) != Some(note_path) {
+                continue;
+            }
+            action(&path, value)?;
+        }
+        Ok(())
+    }
+
     fn safe_recovery_path(&self, draft_path: &str) -> StorageResult<PathBuf> {
         let normalized = draft_path.replace('\\', "/");
         let filename = normalized
@@ -1147,13 +1216,19 @@ impl Library {
     }
 
     pub fn resolve_conflict(&self, path: &str, resolution: &str) -> StorageResult<NoteDocument> {
+        // An unrecognised value must not quietly mean "keep local" — that would
+        // discard the on-disk version on a typo or a stale caller.
+        let resolution = ConflictResolution::parse(resolution)?;
         let connection = self.connection()?;
         let (local, disk): (String, String) = connection.query_row(
             "SELECT local_content, disk_content FROM conflicts WHERE path = ?1",
             params![path],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let selected = if resolution == "disk" { disk } else { local };
+        let selected = match resolution {
+            ConflictResolution::Disk => disk,
+            ConflictResolution::Local => local,
+        };
         drop(connection);
         let absolute = self.safe_path(path)?;
         let current = fs::read_to_string(&absolute)?;
@@ -1595,19 +1670,37 @@ fn atomic_copy(source: &Path, destination: &Path) -> StorageResult<()> {
     replace_file(&temporary, destination)
 }
 
+/// Replace `destination` with `temporary` without ever exposing a partially
+/// written file.
+///
+/// `fs::rename` is atomic within a directory on both platforms Cinqic Notes
+/// targets: POSIX `rename(2)` replaces the destination atomically, and on
+/// Windows `std` uses `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`. A failure
+/// is therefore transient in practice (a Windows sharing violation while an
+/// indexer or antivirus holds the file), so retry briefly.
+///
+/// There is deliberately no copy-over-the-destination fallback. A copy would
+/// truncate the user's note first and could leave it half written if the
+/// process died mid-write, which is exactly the outcome atomic replacement
+/// exists to prevent. If replacement genuinely cannot happen we fail and leave
+/// both the original note and the temporary file intact.
 fn replace_file(temporary: &Path, destination: &Path) -> StorageResult<()> {
-    match fs::rename(temporary, destination) {
-        Ok(()) => Ok(()),
-        Err(_) if destination.exists() => {
-            fs::copy(temporary, destination)?;
-            fs::remove_file(temporary)?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::remove_file(temporary);
-            Err(StorageError::Io(error))
+    let mut last_error = None;
+    for attempt in 0..5 {
+        match fs::rename(temporary, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                }
+            }
         }
     }
+    let _ = fs::remove_file(temporary);
+    Err(StorageError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::other("Could not replace the note file")
+    })))
 }
 
 fn ensure_backup_destination(root: &Path, destination: &Path) -> StorageResult<()> {
@@ -1746,6 +1839,75 @@ fn has_windows_path_prefix(value: &str) -> bool {
         || (value.len() >= 2
             && value.as_bytes()[0].is_ascii_alphabetic()
             && value.as_bytes()[1] == b':')
+}
+
+/// Move every path-keyed safety record with a note.
+///
+/// `revisions`, `conflicts`, and recovery drafts are keyed by note path rather
+/// than by note id, so without this a rename or move silently stranded a
+/// note's entire revision history and any pending conflict under the old path.
+/// The only conflict resolutions the storage layer accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// Keep the buffer the editor was holding.
+    Local,
+    /// Keep the version currently on disk.
+    Disk,
+}
+
+impl ConflictResolution {
+    pub fn parse(value: &str) -> StorageResult<Self> {
+        match value {
+            "local" => Ok(Self::Local),
+            "disk" => Ok(Self::Disk),
+            other => Err(StorageError::InvalidPath(format!(
+                "Unknown conflict resolution: {other}"
+            ))),
+        }
+    }
+}
+
+/// Accept only real `YYYY-MM-DD` calendar dates.
+///
+/// The previous shape check accepted impossible values such as `2026-99-99`,
+/// which would then become a note file named after a date that does not exist.
+fn is_calendar_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        value[0..4].parse::<i32>(),
+        value[5..7].parse::<u32>(),
+        value[8..10].parse::<u32>(),
+    ) else {
+        return false;
+    };
+    chrono::NaiveDate::from_ymd_opt(year, month, day).is_some()
+}
+
+fn migrate_note_metadata(connection: &Connection, old: &str, new: &str) -> StorageResult<()> {
+    if old == new {
+        return Ok(());
+    }
+    connection.execute(
+        "UPDATE revisions SET note_path = ?1 WHERE note_path = ?2",
+        params![new, old],
+    )?;
+    // `conflicts.path` is the primary key, so replace any conflict already
+    // recorded at the destination rather than failing the rename.
+    connection.execute(
+        "UPDATE OR REPLACE conflicts SET path = ?1 WHERE path = ?2",
+        params![new, old],
+    )?;
+    Ok(())
 }
 
 fn record_revision(
@@ -2032,5 +2194,209 @@ mod tests {
         assert!(safe_archive_member(".cinqic/index.sqlite3").is_err());
         assert!(safe_archive_member("nested/note.md").is_ok());
         assert!(safe_archive_member(".cinqic/backup-manifest.json").is_ok());
+    }
+
+    #[test]
+    fn renaming_a_note_keeps_its_revision_history_reachable() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let note = library.create_note("History", NoteFormat::Markdown, "")?;
+        let path = note.summary.path.clone();
+
+        let updated = library.update_note(&path, "# History\n\nfirst\n", None, "local")?;
+        library.update_note(
+            &path,
+            "# History\n\nsecond\n",
+            Some(&updated.summary.hash),
+            "local",
+        )?;
+        let before = library.revisions(&path)?;
+        assert!(!before.is_empty(), "expected revisions before the rename");
+
+        let renamed = library.rename_note(&path, "History Renamed")?;
+        assert_ne!(renamed.summary.path, path);
+
+        let after = library.revisions(&renamed.summary.path)?;
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "revision history must follow the note across a rename"
+        );
+        assert!(library.revisions(&path)?.is_empty());
+
+        // The same must hold for a move into a folder.
+        let moved = library.move_note(&renamed.summary.path, "Archive")?;
+        assert_eq!(library.revisions(&moved.summary.path)?.len(), before.len());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_a_note_carries_a_pending_conflict_with_it() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let note = library.create_note("Contested", NoteFormat::Markdown, "")?;
+        let path = note.summary.path.clone();
+
+        // An external editor changes the file behind the app's back.
+        fs::write(root.join(&path), "# Contested\n\nexternal\n")?;
+        let outcome = library.update_note(&path, "# Contested\n\nlocal\n", None, "local");
+        assert!(matches!(outcome, Err(StorageError::Conflict)));
+        assert!(library.conflict(&path)?.is_some());
+
+        let renamed = library.rename_note(&path, "Contested Renamed")?;
+        assert!(
+            library.conflict(&renamed.summary.path)?.is_some(),
+            "an unresolved conflict must not be stranded under the old path"
+        );
+        assert!(library.conflict(&path)?.is_none());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn conflict_resolution_rejects_an_unknown_value() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let note = library.create_note("Choice", NoteFormat::Markdown, "")?;
+        let path = note.summary.path.clone();
+
+        fs::write(root.join(&path), "# Choice\n\ndisk\n")?;
+        let _ = library.update_note(&path, "# Choice\n\nlocal\n", None, "local");
+        assert!(library.conflict(&path)?.is_some());
+
+        // A typo must not be silently treated as "keep local".
+        assert!(library.resolve_conflict(&path, "Local").is_err());
+        assert!(library.resolve_conflict(&path, "").is_err());
+        assert!(library.resolve_conflict(&path, "theirs").is_err());
+        assert!(library.conflict(&path)?.is_some());
+
+        let resolved = library.resolve_conflict(&path, "disk")?;
+        assert!(resolved.content.contains("disk"));
+        assert!(library.conflict(&path)?.is_none());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn daily_note_dates_must_be_real_calendar_dates() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+
+        for invalid in [
+            "2026-99-99",
+            "2026-13-01",
+            "2026-02-30",
+            "2025-02-29",
+            "0000-00-00",
+            "2026-1-01",
+            "not-a-date",
+        ] {
+            assert!(
+                library.create_daily_note(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+
+        assert!(library.create_daily_note("2026-02-28").is_ok());
+        assert!(library.create_daily_note("2024-02-29").is_ok());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn a_successful_save_retires_recovery_drafts_for_that_note() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let note = library.create_note("Draft", NoteFormat::Markdown, "")?;
+        let path = note.summary.path.clone();
+        let other = library.create_note("Other", NoteFormat::Markdown, "")?;
+
+        library.save_recovery_draft(&path, "# Draft\n\nin progress\n")?;
+        library.save_recovery_draft(&other.summary.path, "# Other\n\nalso in progress\n")?;
+        assert_eq!(library.list_recovery_drafts()?.len(), 2);
+
+        library.update_note(&path, "# Draft\n\nsaved\n", None, "local")?;
+
+        let remaining = library.list_recovery_drafts()?;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the saved note's drafts are retired"
+        );
+        assert_eq!(remaining[0].note_path, other.summary.path);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_drafts_follow_a_renamed_note() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let note = library.create_note("Movable", NoteFormat::Markdown, "")?;
+        let path = note.summary.path.clone();
+        library.save_recovery_draft(&path, "# Movable\n\nunsaved\n")?;
+
+        let renamed = library.rename_note(&path, "Movable Renamed")?;
+        let drafts = library.list_recovery_drafts()?;
+
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].note_path, renamed.summary.path,
+            "a draft must stay attached to the note it belongs to"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn trashing_records_the_note_before_the_file_moves() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        let note = library.create_note("Disposable", NoteFormat::Markdown, "")?;
+        let path = note.summary.path.clone();
+
+        library.trash_note(&path)?;
+
+        // The file left the Library, and the trash row that makes it
+        // recoverable exists, so restore is always possible.
+        assert!(!root.join(&path).exists());
+        let restored = library.restore_note(&path)?;
+        assert_eq!(restored.summary.path, path);
+        assert!(root.join(&path).is_file());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_date_validation_is_strict() {
+        assert!(is_calendar_date("2026-09-08"));
+        assert!(is_calendar_date("2024-02-29"));
+        assert!(!is_calendar_date("2025-02-29"));
+        assert!(!is_calendar_date("2026-00-10"));
+        assert!(!is_calendar_date("2026-12-32"));
+        assert!(!is_calendar_date("2026-09-08 "));
+        assert!(!is_calendar_date("20260908"));
+    }
+
+    #[test]
+    fn conflict_resolution_parses_only_known_values() {
+        assert_eq!(
+            ConflictResolution::parse("local").unwrap(),
+            ConflictResolution::Local
+        );
+        assert_eq!(
+            ConflictResolution::parse("disk").unwrap(),
+            ConflictResolution::Disk
+        );
+        assert!(ConflictResolution::parse("LOCAL").is_err());
+        assert!(ConflictResolution::parse("keep").is_err());
     }
 }
