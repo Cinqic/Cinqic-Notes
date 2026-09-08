@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "A local-first, user-owned notes app by Cinqic.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "author": "Cinqic",
   "packageManager": "pnpm@11.19.0",
   "scripts": {
@@ -23,7 +23,8 @@
     "benchmark:fixtures": "node scripts/generate-benchmark-library.mjs",
     "schema:validate": "node scripts/validate-schemas.mjs",
     "version:check": "node scripts/check-version.mjs",
-    "validate": "pnpm format && pnpm lint && pnpm typecheck && pnpm test && pnpm build && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --locked --manifest-path src-tauri/Cargo.toml && pnpm schema:validate && pnpm version:check"
+    "license:check": "node scripts/check-license.mjs",
+    "validate": "pnpm format && pnpm lint && pnpm typecheck && pnpm test && pnpm build && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --locked --manifest-path src-tauri/Cargo.toml && pnpm schema:validate && pnpm version:check && pnpm license:check"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

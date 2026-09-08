@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A local-first, user-owned notes application."
 authors = ["Cinqic"]
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 rust-version = "1.90"
 
 [lib]

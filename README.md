@@ -86,3 +86,9 @@ in [docs/architecture/notes-core.md](docs/architecture/notes-core.md).
 - `.github/workflows/` — validation and packaging workflows.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
+
+## License
+
+Cinqic Notes is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for
+the full text and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency
+licensing.
