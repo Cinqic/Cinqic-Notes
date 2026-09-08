@@ -23,9 +23,11 @@ contents.
 
 - Note files are user-owned and are only reached through Rust commands that
   validate paths first.
-- The default Tauri capability grants `core:default` and `dialog:default` only.
-  The UI has no blanket filesystem access, no shell execution, and no network
-  permission.
+- The default Tauri capability grants `core:default`, `dialog:default`, and
+  `core:window:allow-destroy`. The last exists so that closing the window can
+  wait for an in-flight save to finish before the window goes away; it is the
+  only window mutation the UI can perform. There is no blanket filesystem
+  access, no shell execution, and no network permission.
 - Library paths reject traversal, absolute paths, Windows drive and UNC
   prefixes, and symlinked files during scans. Archive members are validated the
   same way, with per-member and total size limits on restore.

@@ -149,6 +149,19 @@ export class AutosaveController {
     return !this.isDirty && this.state !== 'conflict' && this.state !== 'error'
   }
 
+  /**
+   * Load content into the buffer as an unsaved edit *without* scheduling a
+   * save. Used when the user is shown recovered work to review: it must not
+   * overwrite the note on disk until they decide to keep it.
+   */
+  hold(content: string) {
+    if (!this.path) return
+    this.clearTimer()
+    this.content = content
+    this.setState(content === this.savedContent ? 'saved' : 'dirty')
+    this.onChange?.(this.snapshot)
+  }
+
   /** Adopt content resolved out-of-band (conflict resolution, revision restore). */
   adopt(path: string, content: string, hash: string) {
     if (this.path !== path) return

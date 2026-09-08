@@ -4,6 +4,7 @@ import { AutosaveController } from './autosave'
 import { useModalDialog } from './dialog'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { notesApi } from '../lib/api'
 import { readTheme, writeTheme } from '../lib/preferences'
 import {
@@ -255,7 +256,9 @@ function NotesWorkspace({
       setTitleDraft(doc.title)
       activePathRef.current = doc.path
       autosave.activate(doc.path, doc.content, doc.hash)
-      if (override !== undefined && override !== doc.content) autosave.edit(override)
+      // Recovered content is held as an unsaved edit, never scheduled: the user
+      // was told to review it before it replaces the note on disk.
+      if (override !== undefined && override !== doc.content) autosave.hold(override)
     },
     [autosave],
   )
@@ -297,7 +300,14 @@ function NotesWorkspace({
    */
   const flushPending = useCallback(async () => {
     if (!autosave.isDirty) return true
-    return autosave.flush()
+    const saved = await autosave.flush()
+    if (!saved) {
+      // Leaving would discard the buffer, so the move is refused. Saying so
+      // matters: otherwise the click simply appears to do nothing.
+      setMessage('This note has unsaved changes that could not be saved — resolve them first')
+      window.setTimeout(() => setMessage(''), 4000)
+    }
+    return saved
   }, [autosave])
 
   // Search requests can resolve out of order. Only the newest request is
@@ -426,17 +436,37 @@ function NotesWorkspace({
     return () => window.clearTimeout(timer)
   }, [activeDocument, content, saveState])
 
-  // Flush an in-progress edit when the window is going away. `beforeunload`
-  // fires for both the browser dev shell and a Tauri window close.
+  // Closing the window must not discard a dirty buffer. `beforeunload` is not
+  // reliably delivered on a native window close, so the desktop path uses
+  // Tauri's close event, holds the close, waits for the save, and only then
+  // destroys the window. If the save cannot complete the window stays open so
+  // the user can resolve it rather than losing the text.
   useEffect(() => {
-    const handler = (event: BeforeUnloadEvent) => {
-      if (!autosave.isDirty) return
-      void autosave.flush()
-      event.preventDefault()
-      event.returnValue = ''
+    if (!isDesktop()) {
+      const handler = (event: BeforeUnloadEvent) => {
+        if (!autosave.isDirty) return
+        event.preventDefault()
+        event.returnValue = ''
+      }
+      window.addEventListener('beforeunload', handler)
+      return () => window.removeEventListener('beforeunload', handler)
     }
-    window.addEventListener('beforeunload', handler)
-    return () => window.removeEventListener('beforeunload', handler)
+    let unlisten: (() => void) | undefined
+    const appWindow = getCurrentWindow()
+    void appWindow
+      .onCloseRequested(async (event) => {
+        if (!autosave.isDirty) return
+        event.preventDefault()
+        if (await autosave.flush()) {
+          await appWindow.destroy()
+          return
+        }
+        setError('Could not save this note, so the window stayed open.')
+      })
+      .then((dispose) => {
+        unlisten = dispose
+      })
+    return () => unlisten?.()
   }, [autosave])
 
   const createNote = async (startingTitle = 'Untitled') => {

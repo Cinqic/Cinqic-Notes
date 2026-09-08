@@ -241,3 +241,58 @@ describe('AutosaveController', () => {
     expect(controller.isDirty).toBe(false)
   })
 })
+
+describe('AutosaveController.hold', () => {
+  it('marks recovered content dirty without scheduling a save', async () => {
+    const requests: string[] = []
+    const controller = new AutosaveController({
+      save: async ({ path, content }) => {
+        requests.push(content)
+        return { path, content, hash: `h:${content}` }
+      },
+      debounceMs: 0,
+    })
+    controller.activate('Note.md', 'on disk', 'h:on disk')
+
+    controller.hold('recovered but unreviewed')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+
+    // The note on disk must not have been overwritten by merely showing the
+    // recovered text to the user.
+    expect(requests).toEqual([])
+    expect(controller.isDirty).toBe(true)
+    expect(controller.snapshot.state).toBe('dirty')
+
+    // An explicit save still writes it.
+    await controller.flush()
+    expect(requests).toEqual(['recovered but unreviewed'])
+  })
+
+  it('a later edit after a hold schedules normally', async () => {
+    const requests: string[] = []
+    const controller = new AutosaveController({
+      save: async ({ path, content }) => {
+        requests.push(content)
+        return { path, content, hash: `h:${content}` }
+      },
+      debounceMs: 0,
+    })
+    controller.activate('Note.md', 'on disk', 'h:on disk')
+    controller.hold('recovered')
+    controller.edit('recovered and edited')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+
+    expect(requests).toEqual(['recovered and edited'])
+  })
+
+  it('holding content identical to disk leaves the note clean', () => {
+    const controller = new AutosaveController({
+      save: async ({ path, content }) => ({ path, content, hash: 'x' }),
+      debounceMs: 0,
+    })
+    controller.activate('Note.md', 'same', 'h:same')
+    controller.hold('same')
+    expect(controller.isDirty).toBe(false)
+    expect(controller.snapshot.state).toBe('saved')
+  })
+})
