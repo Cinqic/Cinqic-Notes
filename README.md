@@ -118,3 +118,11 @@ in [docs/architecture/notes-core.md](docs/architecture/notes-core.md).
 - `docs/licenses/inventory.md` — generated transitive dependency licences.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
+
+## License
+
+Cinqic Notes is licensed under the Apache License 2.0. See [LICENSE](LICENSE)
+for the full text and [NOTICE](NOTICE) for the attribution notice.
+Third-party dependencies keep their own licences; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[docs/licenses/inventory.md](docs/licenses/inventory.md).

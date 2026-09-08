@@ -52,7 +52,8 @@ Performance
 Project
 
 - Completed the Apache-2.0 migration in package metadata and notices, and added
-  a generated transitive dependency licence inventory.
+  a generated transitive dependency licence inventory. `pnpm license:check`
+  now fails validation if a first-party declaration drifts again.
 - A release can no longer publish without `pnpm validate` passing on the exact
   tagged commit.
 - `pnpm schema:validate` now performs real JSON Schema validation.
