@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { AutosaveController } from './autosave'
+import { useModalDialog } from './dialog'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
 import { notesApi } from '../lib/api'
@@ -2102,6 +2103,7 @@ function ShareDialog({
   onExport: (format: 'md' | 'txt' | 'html') => Promise<void>
 }) {
   const [copied, setCopied] = useState('')
+  const shareDialogRef = useModalDialog<HTMLElement>(onClose)
   const copy = async (kind: 'markdown' | 'text') => {
     const value = kind === 'markdown' ? content : toPlainText(content)
     // Reporting success when the clipboard is unavailable — or when writeText
@@ -2141,7 +2143,14 @@ function ShareDialog({
         if (event.currentTarget === event.target) onClose()
       }}
     >
-      <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="share-title">
+      <section
+        className="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="share-title"
+        ref={shareDialogRef}
+        tabIndex={-1}
+      >
         <div className="dialog-heading">
           <div>
             <span className="eyebrow">YOUR FILE</span>
@@ -2213,6 +2222,7 @@ function CommandPalette({
   const [filter, setFilter] = useState('')
   const [selected, setSelected] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
+  const paletteRef = useModalDialog<HTMLElement>(onClose)
   const visible = useMemo(
     () => actions.filter(([label]) => label.toLowerCase().includes(filter.toLowerCase())),
     [actions, filter],
@@ -2238,11 +2248,7 @@ function CommandPalette({
   }
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      onClose()
-      return
-    }
+    // Escape is handled by useModalDialog, which also restores focus.
     if (!visible.length) return
     if (event.key === 'ArrowDown') {
       event.preventDefault()
@@ -2274,6 +2280,8 @@ function CommandPalette({
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
+        ref={paletteRef}
+        tabIndex={-1}
       >
         <div className="command-search">
           <span aria-hidden="true">⌘</span>
