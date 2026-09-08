@@ -20,6 +20,9 @@ button {
 }
 button:focus-visible,
 input:focus-visible,
+select:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible,
 textarea:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--accent) 40%, transparent);
   outline-offset: 2px;
@@ -423,6 +426,13 @@ textarea:focus-visible {
   border-radius: 8px;
   background: var(--surface);
   color: var(--muted);
+}
+/* The input clears its own outline, so the wrapper carries the focus ring —
+   otherwise tabbing to search gives no visible indication of where focus is. */
+.search-box:focus-within {
+  border-color: var(--accent);
+  outline: 3px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  outline-offset: 1px;
 }
 .search-box input {
   min-width: 0;
@@ -1353,6 +1363,9 @@ textarea:focus-visible {
 .command-search > span {
   color: var(--accent-dark);
 }
+.command-search:focus-within {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
 .command-search input {
   min-width: 0;
   flex: 1;
@@ -1379,6 +1392,17 @@ textarea:focus-visible {
 }
 .command-list button:hover {
   background: var(--surface-alt);
+}
+/* The keyboard selection must be visible without relying on colour alone, so
+   it carries a leading marker as well as a background. */
+.command-list button.active {
+  background: var(--surface-alt);
+  box-shadow: inset 2px 0 0 var(--accent);
+  font-weight: 600;
+}
+.command-list button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .command-list kbd {
   color: var(--faint);
@@ -1498,4 +1522,22 @@ textarea:focus-visible {
     overflow: visible;
     resize: none;
   }
+}
+
+/* External links are shown as links but never navigate the WebView; activating
+   one asks the host what to do. See renderSafeMarkdown. */
+.markdown-preview .external-link {
+  color: var(--accent-dark);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.markdown-preview .external-link::after {
+  content: ' ↗';
+  font-size: 0.85em;
+}
+.markdown-preview .external-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }

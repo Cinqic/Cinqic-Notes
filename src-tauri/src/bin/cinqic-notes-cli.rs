@@ -14,6 +14,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Read an optional `--expect <hash>` argument.
+fn expect_flag(values: &[String]) -> Result<Option<String>, String> {
+    let Some(index) = values.iter().position(|value| value == "--expect") else {
+        return Ok(None);
+    };
+    let hash = values
+        .get(index + 1)
+        .ok_or_else(|| "--expect requires a content hash".to_string())?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("--expect requires a 64-character hex content hash".into());
+    }
+    Ok(Some(hash.clone()))
+}
+
 fn run(args: Vec<String>) -> Result<(), String> {
     let Some(library_path) = args.first() else {
         print_help();
@@ -57,9 +71,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "update" => {
             let path = required(values, 0, "note path")?;
             let content = required(values, 1, "content")?;
+            // `--expect <hash>` opts in to the same optimistic write the desktop
+            // editor performs. Without it the write is still refused when the
+            // file changed on disk behind the index, but it cannot detect that
+            // the caller's own copy went stale after an indexed change.
+            let expected = expect_flag(values)?;
             print_json(
                 &library
-                    .update_note(path, content, None, "cli")
+                    .update_note(path, content, expected.as_deref(), "cli")
                     .map_err(|error| error.to_string())?,
             )
         }
@@ -172,6 +191,35 @@ fn print_json<T: Serialize>(value: &T) {
 
 fn print_help() {
     println!(
-        "Usage: cinqic-notes-cli <library> <command> [arguments]\n\nCommands:\n  list\n  search <query>\n  get <path>\n  create <title> [folder] [md|txt]\n  update <path> <content>\n  append <path> <content>\n  rename <path> <title>\n  move <path> [folder]\n  archive <path> [true|false]\n  trash <path>\n  restore <path>\n  tasks\n  tags\n  backlinks <path>\n  graph\n  export <path> <destination> <md|txt|html>\n\nAll operations are local and use the same safe storage boundary as the desktop\napp. The CLI does not start a network listener; Juniper is not required."
+        "Usage: cinqic-notes-cli <library> <command> [arguments]\n\nCommands:\n  list\n  search <query>\n  get <path>\n  create <title> [folder] [md|txt]\n  update <path> <content> [--expect <hash>]\n  append <path> <content>\n  rename <path> <title>\n  move <path> [folder]\n  archive <path> [true|false]\n  trash <path>\n  restore <path>\n  tasks\n  tags\n  backlinks <path>\n  graph\n  export <path> <destination> <md|txt|html>\n\nOptimistic writes:\n  `update` accepts `--expect <hash>`, the contentHash from a previous `get`.\n  With it, the write is refused when the note changed since you read it, which\n  is the same protection the desktop editor uses. Without it, the write is\n  still refused when the file changed on disk behind the index, but a caller\n  holding a stale copy can overwrite a newer indexed change. `append` always\n  supplies the hash it just read.\n\nAll operations are local and use the same safe storage boundary as the desktop\napp. The CLI does not start a network listener; Juniper is not required."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expect_flag;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    const HASH: &str = "d170fa3d7f811494ceb726f07802c5e444a5287c53f820e3f919acde555103bd";
+
+    #[test]
+    fn absent_flag_is_none() {
+        assert_eq!(expect_flag(&args(&["Note.md", "content"])).unwrap(), None);
+    }
+
+    #[test]
+    fn a_valid_hash_is_accepted() {
+        let parsed = expect_flag(&args(&["Note.md", "content", "--expect", HASH])).unwrap();
+        assert_eq!(parsed.as_deref(), Some(HASH));
+    }
+
+    #[test]
+    fn a_malformed_hash_is_rejected_rather_than_ignored() {
+        assert!(expect_flag(&args(&["--expect", "abc"])).is_err());
+        assert!(expect_flag(&args(&["--expect", &"z".repeat(64)])).is_err());
+        assert!(expect_flag(&args(&["--expect"])).is_err());
+    }
 }

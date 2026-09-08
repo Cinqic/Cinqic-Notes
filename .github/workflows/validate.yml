@@ -1,0 +1,45 @@
+name: reusable validation
+
+# The canonical gate, factored out so that both pull requests and the release
+# pipeline run exactly the same checks against exactly the same commit.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to check out and validate.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Frontend, native, schema, and build checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.19.0'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+          components: rustfmt, clippy
+      - name: Install Tauri Linux prerequisites
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev
+          libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - run: pnpm install --frozen-lockfile
+      # `pnpm validate` already runs `pnpm build`, so it is not repeated here.
+      - run: pnpm validate
+      - name: Confirm the checked-out commit
+        run: echo "Validated ${{ github.repository }}@$(git rev-parse HEAD)"

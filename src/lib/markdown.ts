@@ -14,7 +14,15 @@ const inline = (value: string) =>
     .replace(/~~([^~]+)~~/g, '<del>$1</del>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
     .replace(/_([^_]+)_/g, '<em>$1</em>')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" rel="noreferrer">$1</a>')
+    // External links are shown, and are addressable by the app, but are never
+    // a live href. A bare <a href="https://…"> inside the desktop WebView
+    // navigates the application window to a remote page on click, which would
+    // leave the local-first boundary entirely. The host decides what opening a
+    // link means; see `externalHref` in the preview click handler.
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
+      '<span class="external-link" role="link" tabindex="0" data-external-href="$2" title="$2">$1</span>',
+    )
     .replace(/\[([^\]]+)\]\((?!https?:\/\/)[^)]+\)/g, '<span class="wiki-link">$1</span>')
     .replace(/\[\[([^\]]+)\]\]/g, '<span class="wiki-link">$1</span>')
 
@@ -144,6 +152,69 @@ export const renderSafeMarkdown = (source: string, format: 'markdown' | 'text') 
   closeList()
   if (inCode) html.push(`<pre><code>${codeLines.join('\n')}</code></pre>`)
   return html.join('') || '<p class="empty-preview">Nothing to preview yet.</p>'
+}
+
+/**
+ * Convert the supported Markdown subset to readable plain text.
+ *
+ * The previous implementation removed every `*_`#>[]` character one at a time,
+ * which corrupted ordinary prose — `snake_case`, `2 * 3`, and `C#` all lost
+ * characters. This unwraps the constructs the renderer actually understands and
+ * otherwise leaves the user's text exactly as written.
+ */
+export const toPlainText = (source: string) => {
+  const lines = source.split(/\r?\n/)
+  const output: string[] = []
+  let inCode = false
+
+  for (const line of lines) {
+    if (line.trim().startsWith('```')) {
+      inCode = !inCode
+      continue
+    }
+    if (inCode) {
+      output.push(line)
+      continue
+    }
+    let text = line
+    text = text.replace(/^(\s*)(#{1,6})\s+/, '$1')
+    text = text.replace(/^(\s*)>\s?/, '$1')
+    text = text.replace(/^(\s*)[-*+]\s+\[([ xX])\]\s+/, (_match, indent, mark) =>
+      mark.toLowerCase() === 'x' ? `${indent}[done] ` : `${indent}[ ] `,
+    )
+    text = text.replace(/^(\s*)[-*+]\s+/, '$1• ')
+    if (/^\s*-{3,}\s*$/.test(text)) {
+      output.push('')
+      continue
+    }
+    text = inlinePlainText(text)
+    output.push(text)
+  }
+  return output.join('\n')
+}
+
+const inlinePlainText = (value: string) =>
+  value
+    // Images and links keep their visible text, not their target.
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
+    .replace(/\[\[([^\]]+)\]\]/g, '$1')
+    // Emphasis markers are only removed where they actually wrap something,
+    // so `snake_case` and `2 * 3` survive untouched.
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/~~([^~]+)~~/g, '$1')
+    .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:!?]|$)/g, '$1$2')
+    .replace(/(^|[\s(])_([^_\s][^_]*?)_(?=[\s).,;:!?]|$)/g, '$1$2')
+
+/** Today's date as a local `YYYY-MM-DD` calendar date. */
+export const localCalendarDate = (now: Date = new Date()) => {
+  const year = String(now.getFullYear()).padStart(4, '0')
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 export const formatRelativeDate = (iso: string) => {

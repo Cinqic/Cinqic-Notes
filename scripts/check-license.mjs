@@ -39,7 +39,7 @@ if (missing.length > 0) {
 
 // Documentation that states the project's own license. Third-party dependency licenses are
 // deliberately not checked here, so only first-party claims about Cinqic Notes are matched.
-const firstPartyDocs = ['README.md', 'THIRD_PARTY_NOTICES.md']
+const firstPartyDocs = ['README.md', 'NOTICE', 'THIRD_PARTY_NOTICES.md']
 const staleClaim = /Cinqic Notes[^.]{0,120}?\b(MIT|BSD|GPL|MPL|ISC|Unlicense|proprietary)\b/i
 for (const relative of firstPartyDocs) {
   const text = await read(relative)

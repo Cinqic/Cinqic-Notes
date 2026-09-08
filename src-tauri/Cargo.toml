@@ -11,6 +11,18 @@ rust-version = "1.90"
 name = "cinqic_notes_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Both binaries are declared explicitly. The crate produces the desktop
+# application and a headless CLI, and the Tauri bundler needs to know which one
+# is the application: without this it packaged the CLI, so the installed
+# .deb/.AppImage launched the command-line tool instead of the app.
+[[bin]]
+name = "cinqic-notes"
+path = "src/main.rs"
+
+[[bin]]
+name = "cinqic-notes-cli"
+path = "src/bin/cinqic-notes-cli.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.4.1", features = [] }
 

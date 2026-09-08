@@ -1,8 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
+import { AutosaveController } from './autosave'
+import { useModalDialog } from './dialog'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { notesApi } from '../lib/api'
-import { formatRelativeDate, renderSafeMarkdown } from '../lib/markdown'
+import { readTheme, writeTheme } from '../lib/preferences'
+import {
+  formatRelativeDate,
+  localCalendarDate,
+  renderSafeMarkdown,
+  toPlainText,
+} from '../lib/markdown'
 import type {
   BacklinkItem,
   ConflictInfo,
@@ -14,12 +24,12 @@ import type {
   RecoveryDraftInfo,
   RevisionItem,
   SaveState,
+  Theme,
   TagItem,
   TaskItem,
 } from '../types'
 
 type View = 'all' | 'today' | 'projects' | 'tasks' | 'graph' | 'archive' | 'trash' | 'settings'
-type Theme = 'system' | 'light' | 'dark'
 
 const isDesktop = () => '__TAURI_INTERNALS__' in window
 
@@ -39,14 +49,35 @@ const relativeLibraryPath = (notePath: string, targetPath: string) => {
   return [...noteDirectory.map(() => '..'), ...target].join('/') || targetPath
 }
 
+/**
+ * The shortcut that actually focuses the note search box.
+ *
+ * The label used to read "⌘ K" on every platform, which was wrong twice: Ctrl/
+ * Cmd+K opens the command palette, and Windows and Linux are supported targets
+ * that do not have a Command key.
+ */
+const searchShortcutLabel = () => {
+  const platform =
+    typeof navigator === 'undefined'
+      ? ''
+      : ((navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData
+          ?.platform ??
+        navigator.platform ??
+        navigator.userAgent)
+  return /mac|iphone|ipad|ipod/i.test(platform) ? '⌘F' : 'Ctrl F'
+}
+
 export default function App() {
   const [library, setLibrary] = useState<LibraryInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [bootError, setBootError] = useState('')
-  const [theme, setTheme] = useState<Theme>('system')
+  // Appearance is remembered locally; a Settings control that silently reset on
+  // every launch was telling the user something untrue.
+  const [theme, setTheme] = useState<Theme>(readTheme)
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
+    writeTheme(theme)
   }, [theme])
 
   useEffect(() => {
@@ -179,38 +210,145 @@ function NotesWorkspace({
   const activePathRef = useRef<string | null>(null)
   activePathRef.current = activeDocument?.path ?? null
 
+  // Autosave is owned by a serialized controller rather than a bare debounce so
+  // that a late save completion can never overwrite a newer edit, and so that
+  // pending work is flushed — not cancelled — when the user navigates away.
+  const autosaveRef = useRef<AutosaveController | null>(null)
+  if (autosaveRef.current === null) {
+    autosaveRef.current = new AutosaveController({
+      save: async ({ path, content: next, expectedHash }) => {
+        const doc = await notesApi.updateNote(path, next, expectedHash)
+        return { path: doc.path, content: doc.content, hash: doc.hash }
+      },
+      onChange: (snapshot) => setSaveState(snapshot.state),
+      onSaved: (result) => {
+        setActiveDocument((current) =>
+          current && current.path === result.path ? { ...current, hash: result.hash } : current,
+        )
+        setNotes((current) =>
+          current.map((note) =>
+            note.path === result.path ? { ...note, hash: result.hash } : note,
+          ),
+        )
+        setMessage('Saved locally')
+        window.setTimeout(() => setMessage(''), 1800)
+      },
+      onError: (nextError, state) => {
+        setError(displayError(nextError))
+        if (state !== 'conflict') return
+        const path = activePathRef.current
+        if (!path) return
+        void notesApi
+          .getConflict(path)
+          .then(setConflict)
+          .catch(() => undefined)
+      },
+    })
+  }
+  const autosave = autosaveRef.current
+
+  /** Point the editor at a document whose content already matches disk. */
+  const activateDocument = useCallback(
+    (doc: NoteDocument, override?: string) => {
+      const next = override ?? doc.content
+      setActiveDocument(doc)
+      setContent(next)
+      setTitleDraft(doc.title)
+      activePathRef.current = doc.path
+      autosave.activate(doc.path, doc.content, doc.hash)
+      // Recovered content is held as an unsaved edit, never scheduled: the user
+      // was told to review it before it replaces the note on disk.
+      if (override !== undefined && override !== doc.content) autosave.hold(override)
+    },
+    [autosave],
+  )
+
+  /** Record a user edit in both the rendered buffer and the save controller. */
+  const editContent = useCallback(
+    (next: string) => {
+      setContent(next)
+      autosave.edit(next)
+    },
+    [autosave],
+  )
+
+  /**
+   * Cinqic Notes does not navigate to remote pages in this milestone, so an
+   * external link is surfaced as a copyable address rather than being opened.
+   * Letting the WebView follow the link would take the application window to a
+   * remote origin and leave the local-first boundary entirely.
+   */
+  const openExternalLink = useCallback(async (url: string) => {
+    if (!navigator.clipboard?.writeText) {
+      setMessage(`Link: ${url}`)
+      window.setTimeout(() => setMessage(''), 4000)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(url)
+      setMessage('Link address copied — Cinqic Notes does not open remote pages')
+    } catch {
+      setMessage(`Link: ${url}`)
+    }
+    window.setTimeout(() => setMessage(''), 4000)
+  }, [])
+
+  /**
+   * Persist any pending edit before leaving the current buffer. Returns false
+   * when the note is still dirty, so callers can block the navigation instead
+   * of discarding the user's text.
+   */
+  const flushPending = useCallback(async () => {
+    if (!autosave.isDirty) return true
+    const saved = await autosave.flush()
+    if (!saved) {
+      // Leaving would discard the buffer, so the move is refused. Saying so
+      // matters: otherwise the click simply appears to do nothing.
+      setMessage('This note has unsaved changes that could not be saved — resolve them first')
+      window.setTimeout(() => setMessage(''), 4000)
+    }
+    return saved
+  }, [autosave])
+
+  // Search requests can resolve out of order. Only the newest request is
+  // allowed to publish its results.
+  const searchGenerationRef = useRef(0)
   const loadNotes = useCallback(
     async (nextQuery = query, includeTrashed = view === 'trash') => {
+      const generation = (searchGenerationRef.current += 1)
       const result = nextQuery.trim()
         ? await notesApi.searchNotesFiltered(nextQuery.trim(), includeTrashed, view === 'archive')
         : await notesApi.listNotesFiltered(includeTrashed, view === 'archive')
+      if (generation !== searchGenerationRef.current) return result
       setNotes(result)
       return result
     },
     [query, view],
   )
 
-  const selectNote = useCallback(async (path: string) => {
-    try {
-      const doc = await notesApi.getNote(path)
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
-      setSaveState('saved')
-      setError('')
-      setConflict(null)
-      const [nextBacklinks, nextRevisions, nextOutgoingLinks] = await Promise.all([
-        notesApi.getBacklinks(path),
-        notesApi.listRevisions(path),
-        notesApi.getOutgoingLinks(path),
-      ])
-      setBacklinks(nextBacklinks)
-      setRevisions(nextRevisions)
-      setOutgoingLinks(nextOutgoingLinks)
-    } catch (nextError: unknown) {
-      setError(displayError(nextError))
-    }
-  }, [])
+  const selectNote = useCallback(
+    async (path: string) => {
+      // Never drop an unsaved buffer to load another note.
+      if (!(await flushPending())) return
+      try {
+        const doc = await notesApi.getNote(path)
+        activateDocument(doc)
+        setError('')
+        setConflict(null)
+        const [nextBacklinks, nextRevisions, nextOutgoingLinks] = await Promise.all([
+          notesApi.getBacklinks(path),
+          notesApi.listRevisions(path),
+          notesApi.getOutgoingLinks(path),
+        ])
+        setBacklinks(nextBacklinks)
+        setRevisions(nextRevisions)
+        setOutgoingLinks(nextOutgoingLinks)
+      } catch (nextError: unknown) {
+        setError(displayError(nextError))
+      }
+    },
+    [activateDocument, flushPending],
+  )
 
   const refresh = useCallback(
     async (preferredPath?: string) => {
@@ -221,6 +359,7 @@ function NotesWorkspace({
         else if (!nextNotes.length) {
           setActiveDocument(null)
           setContent('')
+          autosave.deactivate()
           setBacklinks([])
           setRevisions([])
           setOutgoingLinks([])
@@ -229,7 +368,7 @@ function NotesWorkspace({
         setError(displayError(nextError))
       }
     },
-    [activeDocument?.path, loadNotes, selectNote, view],
+    [activeDocument?.path, autosave, loadNotes, selectNote, view],
   )
 
   useEffect(() => {
@@ -239,6 +378,25 @@ function NotesWorkspace({
       .then(setTags)
       .catch(() => setTags([]))
   }, [refresh])
+
+  // Run the search. Nothing previously watched `query`, so typing in the search
+  // box updated the input and changed nothing else: the note list only ever
+  // re-queried when the Library changed underneath it.
+  useEffect(() => {
+    const trimmed = query.trim()
+    const timer = window.setTimeout(
+      () => {
+        void loadNotes(query, view === 'trash').catch((nextError: unknown) =>
+          setError(displayError(nextError)),
+        )
+      },
+      trimmed ? 180 : 0,
+    )
+    return () => window.clearTimeout(timer)
+    // `loadNotes` closes over the current query and view; depending on it here
+    // would re-run this effect on every note-list change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, view])
 
   useEffect(() => {
     if (!isDesktop()) return
@@ -278,51 +436,44 @@ function NotesWorkspace({
     return () => window.clearTimeout(timer)
   }, [activeDocument, content, saveState])
 
+  // Closing the window must not discard a dirty buffer. `beforeunload` is not
+  // reliably delivered on a native window close, so the desktop path uses
+  // Tauri's close event, holds the close, waits for the save, and only then
+  // destroys the window. If the save cannot complete the window stays open so
+  // the user can resolve it rather than losing the text.
   useEffect(() => {
-    if (!activeDocument || saveState !== 'dirty') return
-    const path = activeDocument.path
-    const expectedHash = activeDocument.hash
-    const contentToSave = content
-    const timer = window.setTimeout(() => {
-      setSaveState('saving')
-      notesApi
-        .updateNote(path, contentToSave, expectedHash)
-        .then((doc) => {
-          const stillEditing = activePathRef.current === path
-          if (stillEditing) {
-            setActiveDocument(doc)
-            setNotes((current) => current.map((note) => (note.path === path ? doc : note)))
-            if (content === contentToSave) {
-              setContent(doc.content)
-              setSaveState('saved')
-              setMessage('Saved locally')
-              setTimeout(() => setMessage(''), 1800)
-            } else {
-              setActiveDocument(doc)
-              setSaveState('dirty')
-            }
-          }
-        })
-        .catch((nextError: unknown) => {
-          setSaveState('conflict')
-          setError(displayError(nextError))
-          void notesApi
-            .getConflict(path)
-            .then(setConflict)
-            .catch(() => undefined)
-        })
-    }, 450)
-    return () => window.clearTimeout(timer)
-  }, [activeDocument, content, saveState])
+    if (!isDesktop()) {
+      const handler = (event: BeforeUnloadEvent) => {
+        if (!autosave.isDirty) return
+        event.preventDefault()
+        event.returnValue = ''
+      }
+      window.addEventListener('beforeunload', handler)
+      return () => window.removeEventListener('beforeunload', handler)
+    }
+    let unlisten: (() => void) | undefined
+    const appWindow = getCurrentWindow()
+    void appWindow
+      .onCloseRequested(async (event) => {
+        if (!autosave.isDirty) return
+        event.preventDefault()
+        if (await autosave.flush()) {
+          await appWindow.destroy()
+          return
+        }
+        setError('Could not save this note, so the window stayed open.')
+      })
+      .then((dispose) => {
+        unlisten = dispose
+      })
+    return () => unlisten?.()
+  }, [autosave])
 
   const createNote = async (startingTitle = 'Untitled') => {
     try {
       const doc = await notesApi.createNote(startingTitle, 'markdown')
       setView('all')
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
-      setSaveState('saved')
+      activateDocument(doc)
       setNotes((current) => [doc, ...current.filter((note) => note.path !== doc.path)])
       setBacklinks([])
       setRevisions([])
@@ -350,31 +501,17 @@ function NotesWorkspace({
   }
 
   const forceSave = async (): Promise<boolean> => {
-    if (!activeDocument || saveState === 'saving') return false
-    try {
-      setSaveState('saving')
-      const doc = await notesApi.updateNote(activeDocument.path, content, activeDocument.hash)
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setRevisions(await notesApi.listRevisions(doc.path))
-      setSaveState('saved')
-      setMessage('Saved locally')
-      window.setTimeout(() => setMessage(''), 1800)
-      return true
-    } catch (nextError: unknown) {
-      setSaveState('conflict')
-      setError(displayError(nextError))
-      return false
-    }
+    if (!activeDocument) return false
+    const saved = await autosave.flush()
+    if (saved) setRevisions(await notesApi.listRevisions(activeDocument.path))
+    return saved
   }
 
   const renameNote = async () => {
     if (!activeDocument || !titleDraft.trim() || titleDraft.trim() === activeDocument.title) return
     try {
       const doc = await notesApi.renameNote(activeDocument.path, titleDraft.trim())
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
+      activateDocument(doc)
       setNotes((current) => current.map((note) => (note.path === activeDocument.path ? doc : note)))
       setBacklinks(await notesApi.getBacklinks(doc.path))
       setRevisions(await notesApi.listRevisions(doc.path))
@@ -387,12 +524,9 @@ function NotesWorkspace({
 
   const createDailyNote = async () => {
     try {
-      const doc = await notesApi.createDailyNote(new Date().toISOString().slice(0, 10))
+      const doc = await notesApi.createDailyNote(localCalendarDate())
       setView('all')
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
-      setSaveState('saved')
+      activateDocument(doc)
       await refresh(doc.path)
       window.setTimeout(() => editorRef.current?.focus(), 50)
     } catch (nextError: unknown) {
@@ -406,9 +540,7 @@ function NotesWorkspace({
     if (folder === null) return
     try {
       const doc = await notesApi.moveNote(activeDocument.path, folder.trim())
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
+      activateDocument(doc)
       await refresh(doc.path)
       setMessage('Note moved')
     } catch (nextError: unknown) {
@@ -425,14 +557,13 @@ function NotesWorkspace({
       if (archived && view !== 'archive') {
         setActiveDocument(null)
         setContent('')
+        autosave.deactivate()
         setBacklinks([])
         setRevisions([])
         setOutgoingLinks([])
         await refresh()
       } else {
-        setActiveDocument(doc)
-        setContent(doc.content)
-        setTitleDraft(doc.title)
+        activateDocument(doc)
         await refresh(doc.path)
       }
     } catch (nextError: unknown) {
@@ -462,11 +593,7 @@ function NotesWorkspace({
         const image = /\.(png|jpe?g|gif|webp|svg)$/i.test(attachment.path)
         links.push(image ? '![' + name + '](' + relative + ')' : '[' + name + '](' + relative + ')')
       }
-      setContent(
-        (current) =>
-          current + (current.endsWith('\n') ? '' : '\n') + '\n' + links.join('\n') + '\n',
-      )
-      setSaveState('dirty')
+      editContent(content + (content.endsWith('\n') ? '' : '\n') + '\n' + links.join('\n') + '\n')
       setMessage(links.length + ' attachment' + (links.length === 1 ? '' : 's') + ' added')
     } catch (nextError: unknown) {
       setError(displayError(nextError))
@@ -489,8 +616,7 @@ function NotesWorkspace({
     try {
       const doc = await notesApi.toggleTask(task.id, !task.checked)
       if (activeDocument?.path === doc.path) {
-        setActiveDocument(doc)
-        setContent(doc.content)
+        activateDocument(doc)
       }
       setTasks((current) =>
         current.map((item) => (item.id === task.id ? { ...item, checked: !item.checked } : item)),
@@ -541,10 +667,7 @@ function NotesWorkspace({
       ])
       setView('all')
       setShowSettings(false)
-      setActiveDocument(doc)
-      setContent(draftContent)
-      setTitleDraft(doc.title)
-      setSaveState('dirty')
+      activateDocument(doc, draftContent)
       setConflict(null)
       setBacklinks(await notesApi.getBacklinks(doc.path))
       setRevisions(await notesApi.listRevisions(doc.path))
@@ -555,17 +678,15 @@ function NotesWorkspace({
     }
   }
 
-  const changeLibrary = async () => {
-    if (saveState === 'dirty' && !(await forceSave())) return
-    try {
-      const chosen = await open({ directory: true, multiple: false })
-      const path = Array.isArray(chosen) ? chosen[0] : chosen
-      if (!path || path === library.path) return
+  /** Switch the workspace to a Library that already exists on disk. */
+  const openLibraryAt = useCallback(
+    async (path: string, notice: string) => {
       const nextLibrary = await notesApi.openLibrary(path)
       await notesApi.setLastLibrary(path)
       setLibrary(nextLibrary)
       setActiveDocument(null)
       setContent('')
+      autosave.deactivate()
       setTitleDraft('')
       setNotes([])
       setBacklinks([])
@@ -583,7 +704,49 @@ function NotesWorkspace({
       ])
       setNotes(nextNotes)
       setTags(nextTags)
-      setMessage('Library changed')
+      setMessage(notice)
+    },
+    [autosave],
+  )
+
+  const changeLibrary = async () => {
+    if (!(await flushPending())) return
+    try {
+      const chosen = await open({ directory: true, multiple: false })
+      const path = Array.isArray(chosen) ? chosen[0] : chosen
+      if (!path || path === library.path) return
+      await openLibraryAt(path, 'Library changed')
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
+  /**
+   * Restore a backup into a new, empty folder.
+   *
+   * The active Library is never touched: the backend requires a destination
+   * outside it and refuses a non-empty folder, and opening the result is a
+   * separate, explicit step for the user.
+   */
+  const restoreBackup = async (): Promise<string | null> => {
+    const chosenArchive = await open({
+      multiple: false,
+      filters: [{ name: 'ZIP backup', extensions: ['zip'] }],
+    })
+    const archive = Array.isArray(chosenArchive) ? chosenArchive[0] : chosenArchive
+    if (!archive) return null
+    const chosenDestination = await open({ directory: true, multiple: false })
+    const destination = Array.isArray(chosenDestination) ? chosenDestination[0] : chosenDestination
+    if (!destination) return null
+    await notesApi.restoreBackup(archive, destination)
+    return destination
+  }
+
+  const openRestoredLibrary = async (path: string) => {
+    if (!(await flushPending())) return
+    try {
+      await openLibraryAt(path, 'Restored Library opened')
+      setShowSettings(false)
     } catch (nextError: unknown) {
       setError(displayError(nextError))
     }
@@ -632,8 +795,7 @@ function NotesWorkspace({
         const end = editor.selectionEnd
         const marker = event.key.toLowerCase() === 'b' ? '**' : '*'
         const selected = content.slice(start, end)
-        setContent(content.slice(0, start) + marker + selected + marker + content.slice(end))
-        setSaveState('dirty')
+        editContent(content.slice(0, start) + marker + selected + marker + content.slice(end))
         requestAnimationFrame(() => {
           editor.focus()
           editor.setSelectionRange(start + marker.length, end + marker.length)
@@ -866,10 +1028,7 @@ function NotesWorkspace({
               try {
                 const doc = await notesApi.restoreNote(path)
                 setView('all')
-                setActiveDocument(doc)
-                setContent(doc.content)
-                setTitleDraft(doc.title)
-                setSaveState('saved')
+                activateDocument(doc)
                 await refresh(doc.path)
                 setMessage('Note restored')
               } catch (nextError: unknown) {
@@ -883,6 +1042,8 @@ function NotesWorkspace({
             setTheme={setTheme}
             library={library}
             onBackup={exportBackupWithMode}
+            onRestoreBackup={restoreBackup}
+            onOpenRestored={openRestoredLibrary}
             onChangeLibrary={changeLibrary}
             onRecoverDraft={recoverDraft}
             onRebuild={async () => {
@@ -917,10 +1078,10 @@ function NotesWorkspace({
             )}
             <EditorPane
               document={activeDocument}
+              onExternalLink={(url) => void openExternalLink(url)}
               content={content}
               setContent={(next) => {
-                setContent(next)
-                setSaveState('dirty')
+                editContent(next)
               }}
               titleDraft={titleDraft}
               setTitleDraft={setTitleDraft}
@@ -948,10 +1109,8 @@ function NotesWorkspace({
                   void notesApi
                     .resolveConflict(activeDocument.path, resolution)
                     .then((doc) => {
-                      setActiveDocument(doc)
-                      setContent(doc.content)
+                      activateDocument(doc)
                       setConflict(null)
-                      setSaveState('saved')
                       return Promise.all([
                         notesApi.getBacklinks(doc.path),
                         notesApi.listRevisions(doc.path),
@@ -970,22 +1129,24 @@ function NotesWorkspace({
                 if (!activeDocument) return
                 try {
                   const doc = await notesApi.restoreRevision(activeDocument.path, revisionId)
-                  setActiveDocument(doc)
-                  setContent(doc.content)
+                  activateDocument(doc)
                   setBacklinks(await notesApi.getBacklinks(doc.path))
                   setRevisions(await notesApi.listRevisions(doc.path))
                   setOutgoingLinks(await notesApi.getOutgoingLinks(doc.path))
-                  setSaveState('saved')
                   setMessage('Revision restored')
                 } catch (nextError: unknown) {
                   setError(displayError(nextError))
                 }
               }}
               onCopyRevision={(revision) => {
+                if (!navigator.clipboard?.writeText) {
+                  setError('Clipboard is unavailable here.')
+                  return
+                }
                 void navigator.clipboard
-                  ?.writeText(revision.content)
+                  .writeText(revision.content)
                   .then(() => setMessage('Revision copied'))
-                  .catch((nextError: unknown) => setError(displayError(nextError)))
+                  .catch(() => setError('Could not copy — the clipboard was refused.'))
               }}
             />
           </div>
@@ -1102,7 +1263,7 @@ function NoteList({
           placeholder="Search notes"
           aria-label="Search notes"
         />
-        <kbd>⌘ K</kbd>
+        <kbd>{searchShortcutLabel()}</kbd>
       </label>
       <div className="note-filters" aria-label="Note filters">
         <label>
@@ -1240,6 +1401,7 @@ function TrashView({
 
 function EditorPane({
   document,
+  onExternalLink,
   content,
   setContent,
   titleDraft,
@@ -1267,6 +1429,7 @@ function EditorPane({
   onCopyRevision,
 }: {
   document: NoteDocument | null
+  onExternalLink: (url: string) => void
   content: string
   setContent: (value: string) => void
   titleDraft: string
@@ -1293,6 +1456,23 @@ function EditorPane({
   onRestoreRevision: (revisionId: string) => Promise<void>
   onCopyRevision: (revision: RevisionItem) => void
 }) {
+  /**
+   * Activate a rendered external link. The preview never emits a live href, so
+   * nothing happens unless the user deliberately activates the element, and the
+   * host decides what "opening" means rather than the WebView navigating.
+   */
+  const handlePreviewActivate = (
+    event: ReactMouseEvent<HTMLElement> | ReactKeyboardEvent<HTMLElement>,
+  ) => {
+    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>(
+      '[data-external-href]',
+    )
+    const url = target?.dataset.externalHref
+    if (!url) return
+    event.preventDefault()
+    onExternalLink(url)
+  }
+
   const [showMeta, setShowMeta] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
   if (!document)
@@ -1387,6 +1567,10 @@ function EditorPane({
         {showPreview ? (
           <article
             className="markdown-preview"
+            onClick={handlePreviewActivate}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') handlePreviewActivate(event)
+            }}
             dangerouslySetInnerHTML={{ __html: renderSafeMarkdown(content, document.format) }}
           />
         ) : (
@@ -1660,6 +1844,8 @@ function SettingsView({
   library,
   onBackup,
   onChangeLibrary,
+  onRestoreBackup,
+  onOpenRestored,
   onRecoverDraft,
   onRebuild,
 }: {
@@ -1668,6 +1854,8 @@ function SettingsView({
   library: LibraryInfo
   onBackup: (includeInternal: boolean) => Promise<void>
   onChangeLibrary: () => Promise<void>
+  onRestoreBackup: () => Promise<string | null>
+  onOpenRestored: (path: string) => Promise<void>
   onRecoverDraft: (draft: RecoveryDraftInfo) => Promise<void>
   onRebuild: () => Promise<void>
 }) {
@@ -1675,6 +1863,22 @@ function SettingsView({
   const [integrity, setIntegrity] = useState('')
   const [drafts, setDrafts] = useState<RecoveryDraftInfo[]>([])
   const [notice, setNotice] = useState('')
+  const [restored, setRestored] = useState('')
+  const [restoreError, setRestoreError] = useState('')
+
+  const runRestore = async () => {
+    setWorking(true)
+    setRestoreError('')
+    setRestored('')
+    try {
+      const destination = await onRestoreBackup()
+      if (destination) setRestored(destination)
+    } catch (nextError: unknown) {
+      setRestoreError(displayError(nextError))
+    } finally {
+      setWorking(false)
+    }
+  }
 
   useEffect(() => {
     void notesApi
@@ -1785,6 +1989,46 @@ function SettingsView({
         </section>
         <section className="settings-card">
           <div>
+            <span className="setting-icon">↑</span>
+            <div>
+              <h2>Restore a backup</h2>
+              <p>
+                Restore a backup ZIP into a new, empty folder. Your current Library is never
+                overwritten, and the restored copy only opens when you choose to open it.
+              </p>
+            </div>
+          </div>
+          <div className="setting-actions">
+            <button
+              className="button secondary small"
+              disabled={working}
+              onClick={() => void runRestore()}
+            >
+              Restore from ZIP…
+            </button>
+            {restored && (
+              <button
+                className="button small"
+                disabled={working}
+                onClick={() => void onOpenRestored(restored)}
+              >
+                Open restored Library
+              </button>
+            )}
+          </div>
+          {restored && (
+            <span className="setting-status muted" role="status">
+              Restored to <code>{restored}</code>
+            </span>
+          )}
+          {restoreError && (
+            <span className="setting-status" role="alert">
+              {restoreError}
+            </span>
+          )}
+        </section>
+        <section className="settings-card">
+          <div>
             <span className="setting-icon">✓</span>
             <div>
               <h2>Repair and recovery</h2>
@@ -1889,15 +2133,24 @@ function ShareDialog({
   onExport: (format: 'md' | 'txt' | 'html') => Promise<void>
 }) {
   const [copied, setCopied] = useState('')
+  const shareDialogRef = useModalDialog<HTMLElement>(onClose)
   const copy = async (kind: 'markdown' | 'text') => {
-    const value =
-      kind === 'markdown'
-        ? content
-        : content
-            .split('')
-            .filter((character) => !'*_`#>[]'.includes(character))
-            .join('')
-    await navigator.clipboard?.writeText(value)
+    const value = kind === 'markdown' ? content : toPlainText(content)
+    // Reporting success when the clipboard is unavailable — or when writeText
+    // was rejected because the document was not focused or permission was
+    // refused — tells the user their note is somewhere it is not.
+    if (!navigator.clipboard?.writeText) {
+      setCopied('Clipboard is unavailable here')
+      window.setTimeout(() => setCopied(''), 2600)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(value)
+    } catch {
+      setCopied('Could not copy — the clipboard was refused')
+      window.setTimeout(() => setCopied(''), 2600)
+      return
+    }
     setCopied(kind === 'markdown' ? 'Markdown copied' : 'Plain text copied')
     window.setTimeout(() => setCopied(''), 1800)
   }
@@ -1920,7 +2173,14 @@ function ShareDialog({
         if (event.currentTarget === event.target) onClose()
       }}
     >
-      <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="share-title">
+      <section
+        className="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="share-title"
+        ref={shareDialogRef}
+        tabIndex={-1}
+      >
         <div className="dialog-heading">
           <div>
             <span className="eyebrow">YOUR FILE</span>
@@ -1990,7 +2250,54 @@ function CommandPalette({
   actions: Array<[string, () => void | Promise<void>]>
 }) {
   const [filter, setFilter] = useState('')
-  const visible = actions.filter(([label]) => label.toLowerCase().includes(filter.toLowerCase()))
+  const [selected, setSelected] = useState(0)
+  const listRef = useRef<HTMLDivElement>(null)
+  const paletteRef = useModalDialog<HTMLElement>(onClose)
+  const visible = useMemo(
+    () => actions.filter(([label]) => label.toLowerCase().includes(filter.toLowerCase())),
+    [actions, filter],
+  )
+
+  // Keep the selection inside the filtered list as the user types.
+  const active = visible.length ? Math.min(selected, visible.length - 1) : -1
+  useEffect(() => setSelected(0), [filter])
+
+  // Follow the selection when it moves out of view via the keyboard.
+  useEffect(() => {
+    if (active < 0) return
+    listRef.current
+      ?.querySelector<HTMLElement>(`[data-index="${active}"]`)
+      ?.scrollIntoView({ block: 'nearest' })
+  }, [active])
+
+  const run = (index: number) => {
+    const entry = visible[index]
+    if (!entry) return
+    void entry[1]()
+    onClose()
+  }
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    // Escape is handled by useModalDialog, which also restores focus.
+    if (!visible.length) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setSelected((current) => (current + 1) % visible.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setSelected((current) => (current - 1 + visible.length) % visible.length)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setSelected(0)
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setSelected(visible.length - 1)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      run(active)
+    }
+  }
+
   return (
     <div
       className="modal-backdrop"
@@ -2003,34 +2310,41 @@ function CommandPalette({
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
+        ref={paletteRef}
+        tabIndex={-1}
       >
         <div className="command-search">
-          <span>⌘</span>
+          <span aria-hidden="true">⌘</span>
           <input
             autoFocus
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
             placeholder="What do you want to do?"
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') onClose()
-              if (event.key === 'Enter' && visible[0]) {
-                void visible[0][1]()
-                onClose()
-              }
-            }}
+            onKeyDown={onKeyDown}
+            role="combobox"
+            aria-expanded={visible.length > 0}
+            aria-controls="command-list"
+            aria-activedescendant={active >= 0 ? `command-option-${active}` : undefined}
+            aria-label="Search commands"
+            autoComplete="off"
           />
         </div>
-        <div className="command-list">
-          {visible.map(([label, action]) => (
+        <div className="command-list" id="command-list" role="listbox" ref={listRef}>
+          {visible.map(([label], index) => (
             <button
               key={label}
-              onClick={() => {
-                void action()
-                onClose()
-              }}
+              id={`command-option-${index}`}
+              data-index={index}
+              role="option"
+              aria-selected={index === active}
+              className={index === active ? 'active' : undefined}
+              // Keep focus in the input so the combobox keeps handling keys.
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => setSelected(index)}
+              onClick={() => run(index)}
             >
               {label}
-              <kbd>↵</kbd>
+              {index === active && <kbd>↵</kbd>}
             </button>
           ))}
           {!visible.length && <p>No matching command.</p>}
@@ -2038,7 +2352,7 @@ function CommandPalette({
         <div className="command-foot">
           <span>↑↓ Navigate</span>
           <span>↵ Run</span>
-          <span>esc Close</span>
+          <span>Esc Close</span>
         </div>
       </section>
     </div>

@@ -22,6 +22,7 @@
     "tauri:build": "tauri build",
     "benchmark:fixtures": "node scripts/generate-benchmark-library.mjs",
     "schema:validate": "node scripts/validate-schemas.mjs",
+    "license:inventory": "node scripts/license-inventory.mjs",
     "version:check": "node scripts/check-version.mjs",
     "license:check": "node scripts/check-license.mjs",
     "validate": "pnpm format && pnpm lint && pnpm typecheck && pnpm test && pnpm build && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --locked --manifest-path src-tauri/Cargo.toml && pnpm schema:validate && pnpm version:check && pnpm license:check"
@@ -38,6 +39,7 @@
     "@types/react": "19.1.10",
     "@types/react-dom": "19.1.7",
     "@vitejs/plugin-react": "5.0.2",
+    "ajv": "8.20.0",
     "eslint": "9.34.0",
     "eslint-plugin-react-hooks": "5.2.0",
     "jsdom": "26.1.0",
