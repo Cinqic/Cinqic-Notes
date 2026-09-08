@@ -9,3 +9,5 @@
   and optimistic conflict protection.
 - Added a calm responsive React/Tauri shell with light, dark, and system themes.
 - Added a documented, disabled-by-default Juniper Notes Core boundary.
+- Licensed the project under the Apache License 2.0 and made every first-party
+  license declaration consistent, enforced by `pnpm license:check` in `pnpm validate`.
