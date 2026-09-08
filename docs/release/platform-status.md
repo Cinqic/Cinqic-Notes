@@ -8,22 +8,37 @@ inferred from a successful compile.
 Environment: Linux 7.0.0-31-generic, AMD Ryzen 7 5700G, 16 cores, 14 GB RAM,
 ext4, Node 22.23.2, pnpm 11.19.0, Rust 1.98.0.
 
-| Step                                                        | Status            |
-| ----------------------------------------------------------- | ----------------- |
-| `pnpm validate` (the full canonical gate)                   | Passed            |
-| Rust test suite                                             | Passed            |
-| Release CLI binary built and exercised                      | Passed            |
-| 1,000 and 10,000 note fixtures indexed, searched, listed    | Passed            |
-| Linux `.deb` / AppImage packages built                      | **Not performed** |
-| Any Linux package installed or launched                     | **Not performed** |
-| Tauri desktop window launched (`tauri dev` / `tauri build`) | **Not performed** |
-| Windows build, install, or smoke test                       | **Not performed** |
+| Step                                                                        | Status                                                    |
+| --------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `pnpm validate` (the full canonical gate)                                   | Passed                                                    |
+| Rust test suite                                                             | Passed                                                    |
+| Clean-clone validation at the candidate SHA                                 | Passed                                                    |
+| Release CLI binary built and exercised                                      | Passed                                                    |
+| 1,000 and 10,000 note fixtures indexed, searched, listed                    | Passed                                                    |
+| Linux `.deb` and AppImage built (`pnpm tauri build`)                        | Passed                                                    |
+| `.deb` payload inspected: ships `usr/bin/cinqic-notes`, `Exec=cinqic-notes` | Passed                                                    |
+| Packaged application launched from the extracted `.deb` on `DISPLAY=:0`     | Passed — started and stayed running with no stderr output |
+| Application driven through its interface (clicking, typing, screenshots)    | **Not performed**                                         |
+| `.deb` installed with `dpkg -i`, uninstalled, or upgraded                   | **Not performed**                                         |
+| AppImage executed as a packaged AppImage                                    | **Not performed** — payload extracted and inspected only  |
+| Windows build, install, or smoke test                                       | **Not performed**                                         |
 
-The GUI was not launched during this review: this environment has no desktop
-session available for a WebKitGTK window, so no claim is made about the running
-application's behaviour on screen. Frontend logic was covered by unit tests
-instead, and the storage engine through the CLI, which uses the same code path
-as the desktop commands.
+Building the packages found a release-blocking defect that no amount of source
+review would have shown: the bundler selected the headless CLI as the
+application, so the `.deb` and AppImage contained only `cinqic-notes-cli`, and
+the desktop entry launched it with `Terminal=false`. Installing the release and
+clicking the icon would have run a command-line tool that printed usage to a
+terminal that does not exist and exited. It is fixed, and the release workflow
+now asserts the package payload rather than only that a bundle file exists.
+
+The application was launched and confirmed to keep running, but it was **not
+driven**: this environment offered no reliable way to capture or interact with
+the window, so nothing is claimed about how the interface behaves on screen.
+The frontend changes on this branch are covered by unit tests over the extracted
+logic — the autosave controller, the dialog focus rules, Markdown and plain-text
+conversion, preferences — but their wiring inside `App.tsx` has been type-checked
+and linted, not exercised in a running window. That is the largest remaining
+evidence gap on this branch.
 
 ## Earlier milestone claim (not re-verified here)
 
