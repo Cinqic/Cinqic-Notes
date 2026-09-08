@@ -30,6 +30,12 @@ const readJson = async (relative) => JSON.parse(await readFile(resolve(root, rel
 const failures = []
 const record = (message) => failures.push(message)
 
+const omit = (value, key) => {
+  const copy = { ...value }
+  delete copy[key]
+  return copy
+}
+
 /** A note that satisfies every constraint, used as the base for negative cases. */
 const validNote = () => ({
   id: 'a1',
@@ -58,8 +64,8 @@ const noteCases = {
     ['a short content hash', { ...validNote(), contentHash: 'abc' }],
     ['an uppercase content hash', { ...validNote(), contentHash: 'A'.repeat(64) }],
     ['an empty id', { ...validNote(), id: '' }],
-    ['a missing title', (({ title: _title, ...rest }) => rest)(validNote())],
-    ['a missing path', (({ path: _path, ...rest }) => rest)(validNote())],
+    ['a missing title', omit(validNote(), 'title')],
+    ['a missing path', omit(validNote(), 'path')],
   ],
 }
 
