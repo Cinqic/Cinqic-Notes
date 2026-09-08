@@ -2,6 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Cinqic Notes",
   "version": "0.1.0",
+  "mainBinaryName": "cinqic-notes",
   "identifier": "com.cinqic.notes",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -35,7 +36,10 @@
     "targets": ["msi", "deb", "appimage"],
     "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
     "windows": {
-      "wix": { "version": "0.1.0.0", "upgradeCode": "b51d1e38-8df6-4a5e-ae9b-8d2e5f2fb6a0" }
+      "wix": {
+        "version": "0.1.0.0",
+        "upgradeCode": "b51d1e38-8df6-4a5e-ae9b-8d2e5f2fb6a0"
+      }
     }
   }
 }

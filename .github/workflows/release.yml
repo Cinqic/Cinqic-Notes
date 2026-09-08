@@ -61,6 +61,37 @@ jobs:
           fi
       - run: pnpm install --frozen-lockfile
       - run: pnpm tauri build --bundles ${{ matrix.bundles }} -- --locked
+      # A bundle that exists is not a bundle that works. This branch shipped a
+      # .deb and .AppImage whose only binary was the headless CLI, with the
+      # desktop entry pointing at it, so installing the package launched a
+      # command-line tool that printed usage and exited. Assert the payload.
+      - name: Verify the Linux package ships the application
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find src-tauri/target/release/bundle/deb -name '*.deb' -print -quit)"
+          extracted="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$extracted"
+          test -x "$extracted/usr/bin/cinqic-notes"             || { echo "The package does not contain the cinqic-notes binary" >&2; exit 1; }
+          entry="$(find "$extracted/usr/share/applications" -name '*.desktop' -print -quit)"
+          grep -qx 'Exec=cinqic-notes' "$entry"             || { echo "Desktop entry does not launch cinqic-notes:" >&2; cat "$entry" >&2; exit 1; }
+          # The application embeds the frontend, so it is far larger than the CLI.
+          size="$(stat -c%s "$extracted/usr/bin/cinqic-notes")"
+          test "$size" -gt 8000000             || { echo "cinqic-notes is only $size bytes; that is not the app" >&2; exit 1; }
+          echo "Package ships cinqic-notes ($size bytes) and launches it."
+
+      - name: Verify the Windows package ships the application
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="src-tauri/target/release/cinqic-notes.exe"
+          test -f "$exe" || { echo "Missing $exe" >&2; ls -la src-tauri/target/release >&2; exit 1; }
+          size="$(stat -c%s "$exe")"
+          test "$size" -gt 8000000             || { echo "cinqic-notes.exe is only $size bytes; that is not the app" >&2; exit 1; }
+          echo "Built cinqic-notes.exe ($size bytes)."
+
       - name: Collect artifacts
         shell: bash
         run: |
