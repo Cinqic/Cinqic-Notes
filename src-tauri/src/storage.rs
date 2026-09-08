@@ -73,7 +73,8 @@ impl Library {
 
     fn prepare(&self) -> StorageResult<()> {
         fs::create_dir_all(self.root.join(INDEX_DIR).join("recovery"))?;
-        fs::create_dir_all(self.root.join(INDEX_DIR).join("revisions"))?;
+        // Revisions live in the `revisions` table, not on disk. The directory
+        // this used to create was never written to.
         fs::create_dir_all(self.root.join(INDEX_DIR).join("trash"))?;
         let connection = self.connection()?;
         migrate(&connection)
@@ -2372,6 +2373,87 @@ mod tests {
         assert!(root.join(&path).is_file());
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_backup_round_trips_notes_attachments_and_revisions() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+
+        let note = library.create_note("Round Trip", NoteFormat::Markdown, "Projects")?;
+        let path = note.summary.path.clone();
+        let first = library.update_note(&path, "# Round Trip\n\nfirst\n", None, "local")?;
+        library.update_note(
+            &path,
+            "# Round Trip\n\nsecond\n",
+            Some(&first.summary.hash),
+            "local",
+        )?;
+        library.create_note("Ünïcode ✓", NoteFormat::Text, "Nested/Deeper")?;
+        let revisions_before = library.revisions(&path)?.len();
+        assert!(revisions_before > 0);
+
+        let archive = root.with_extension("full-backup.zip");
+        library.backup_library(&archive.to_string_lossy(), true)?;
+        assert!(archive.is_file());
+
+        let restored_root = temp_library();
+        library.restore_backup(&archive.to_string_lossy(), &restored_root.to_string_lossy())?;
+        let restored = Library::open(&restored_root)?;
+
+        assert_eq!(
+            restored.get_note(&path)?.content,
+            "# Round Trip\n\nsecond\n"
+        );
+        assert!(restored_root.join("Nested/Deeper").is_dir());
+        assert_eq!(
+            restored.revisions(&path)?.len(),
+            revisions_before,
+            "a full backup must carry revision history"
+        );
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(restored_root);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_refuses_unsafe_destinations() -> StorageResult<()> {
+        let root = temp_library();
+        let library = Library::create(&root)?;
+        library.create_note("Anything", NoteFormat::Markdown, "")?;
+        let archive = root.with_extension("backup.zip");
+        library.backup_library(&archive.to_string_lossy(), false)?;
+
+        // Inside the active Library.
+        let inside = root.join("restored");
+        assert!(
+            library
+                .restore_backup(&archive.to_string_lossy(), &inside.to_string_lossy())
+                .is_err(),
+            "restoring into the active Library must be refused"
+        );
+
+        // A destination that already has content in it.
+        let occupied = temp_library();
+        fs::create_dir_all(&occupied)?;
+        fs::write(occupied.join("existing.md"), "do not overwrite me\n")?;
+        assert!(
+            library
+                .restore_backup(&archive.to_string_lossy(), &occupied.to_string_lossy())
+                .is_err(),
+            "restoring over existing files must be refused"
+        );
+        assert_eq!(
+            fs::read_to_string(occupied.join("existing.md"))?,
+            "do not overwrite me\n"
+        );
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(occupied);
         Ok(())
     }
 

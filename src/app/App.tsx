@@ -647,12 +647,9 @@ function NotesWorkspace({
     }
   }
 
-  const changeLibrary = async () => {
-    if (!(await flushPending())) return
-    try {
-      const chosen = await open({ directory: true, multiple: false })
-      const path = Array.isArray(chosen) ? chosen[0] : chosen
-      if (!path || path === library.path) return
+  /** Switch the workspace to a Library that already exists on disk. */
+  const openLibraryAt = useCallback(
+    async (path: string, notice: string) => {
       const nextLibrary = await notesApi.openLibrary(path)
       await notesApi.setLastLibrary(path)
       setLibrary(nextLibrary)
@@ -676,7 +673,49 @@ function NotesWorkspace({
       ])
       setNotes(nextNotes)
       setTags(nextTags)
-      setMessage('Library changed')
+      setMessage(notice)
+    },
+    [autosave],
+  )
+
+  const changeLibrary = async () => {
+    if (!(await flushPending())) return
+    try {
+      const chosen = await open({ directory: true, multiple: false })
+      const path = Array.isArray(chosen) ? chosen[0] : chosen
+      if (!path || path === library.path) return
+      await openLibraryAt(path, 'Library changed')
+    } catch (nextError: unknown) {
+      setError(displayError(nextError))
+    }
+  }
+
+  /**
+   * Restore a backup into a new, empty folder.
+   *
+   * The active Library is never touched: the backend requires a destination
+   * outside it and refuses a non-empty folder, and opening the result is a
+   * separate, explicit step for the user.
+   */
+  const restoreBackup = async (): Promise<string | null> => {
+    const chosenArchive = await open({
+      multiple: false,
+      filters: [{ name: 'ZIP backup', extensions: ['zip'] }],
+    })
+    const archive = Array.isArray(chosenArchive) ? chosenArchive[0] : chosenArchive
+    if (!archive) return null
+    const chosenDestination = await open({ directory: true, multiple: false })
+    const destination = Array.isArray(chosenDestination) ? chosenDestination[0] : chosenDestination
+    if (!destination) return null
+    await notesApi.restoreBackup(archive, destination)
+    return destination
+  }
+
+  const openRestoredLibrary = async (path: string) => {
+    if (!(await flushPending())) return
+    try {
+      await openLibraryAt(path, 'Restored Library opened')
+      setShowSettings(false)
     } catch (nextError: unknown) {
       setError(displayError(nextError))
     }
@@ -972,6 +1011,8 @@ function NotesWorkspace({
             setTheme={setTheme}
             library={library}
             onBackup={exportBackupWithMode}
+            onRestoreBackup={restoreBackup}
+            onOpenRestored={openRestoredLibrary}
             onChangeLibrary={changeLibrary}
             onRecoverDraft={recoverDraft}
             onRebuild={async () => {
@@ -1772,6 +1813,8 @@ function SettingsView({
   library,
   onBackup,
   onChangeLibrary,
+  onRestoreBackup,
+  onOpenRestored,
   onRecoverDraft,
   onRebuild,
 }: {
@@ -1780,6 +1823,8 @@ function SettingsView({
   library: LibraryInfo
   onBackup: (includeInternal: boolean) => Promise<void>
   onChangeLibrary: () => Promise<void>
+  onRestoreBackup: () => Promise<string | null>
+  onOpenRestored: (path: string) => Promise<void>
   onRecoverDraft: (draft: RecoveryDraftInfo) => Promise<void>
   onRebuild: () => Promise<void>
 }) {
@@ -1787,6 +1832,22 @@ function SettingsView({
   const [integrity, setIntegrity] = useState('')
   const [drafts, setDrafts] = useState<RecoveryDraftInfo[]>([])
   const [notice, setNotice] = useState('')
+  const [restored, setRestored] = useState('')
+  const [restoreError, setRestoreError] = useState('')
+
+  const runRestore = async () => {
+    setWorking(true)
+    setRestoreError('')
+    setRestored('')
+    try {
+      const destination = await onRestoreBackup()
+      if (destination) setRestored(destination)
+    } catch (nextError: unknown) {
+      setRestoreError(displayError(nextError))
+    } finally {
+      setWorking(false)
+    }
+  }
 
   useEffect(() => {
     void notesApi
@@ -1894,6 +1955,46 @@ function SettingsView({
             </button>
           </div>
           {notice && <span className="setting-status muted">{notice}</span>}
+        </section>
+        <section className="settings-card">
+          <div>
+            <span className="setting-icon">↑</span>
+            <div>
+              <h2>Restore a backup</h2>
+              <p>
+                Restore a backup ZIP into a new, empty folder. Your current Library is never
+                overwritten, and the restored copy only opens when you choose to open it.
+              </p>
+            </div>
+          </div>
+          <div className="setting-actions">
+            <button
+              className="button secondary small"
+              disabled={working}
+              onClick={() => void runRestore()}
+            >
+              Restore from ZIP…
+            </button>
+            {restored && (
+              <button
+                className="button small"
+                disabled={working}
+                onClick={() => void onOpenRestored(restored)}
+              >
+                Open restored Library
+              </button>
+            )}
+          </div>
+          {restored && (
+            <span className="setting-status muted" role="status">
+              Restored to <code>{restored}</code>
+            </span>
+          )}
+          {restoreError && (
+            <span className="setting-status" role="alert">
+              {restoreError}
+            </span>
+          )}
         </section>
         <section className="settings-card">
           <div>
