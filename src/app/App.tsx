@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { AutosaveController } from './autosave'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
 import { notesApi } from '../lib/api'
-import { formatRelativeDate, renderSafeMarkdown } from '../lib/markdown'
+import { readTheme, writeTheme } from '../lib/preferences'
+import {
+  formatRelativeDate,
+  localCalendarDate,
+  renderSafeMarkdown,
+  toPlainText,
+} from '../lib/markdown'
 import type {
   BacklinkItem,
   ConflictInfo,
@@ -15,12 +22,12 @@ import type {
   RecoveryDraftInfo,
   RevisionItem,
   SaveState,
+  Theme,
   TagItem,
   TaskItem,
 } from '../types'
 
 type View = 'all' | 'today' | 'projects' | 'tasks' | 'graph' | 'archive' | 'trash' | 'settings'
-type Theme = 'system' | 'light' | 'dark'
 
 const isDesktop = () => '__TAURI_INTERNALS__' in window
 
@@ -40,14 +47,35 @@ const relativeLibraryPath = (notePath: string, targetPath: string) => {
   return [...noteDirectory.map(() => '..'), ...target].join('/') || targetPath
 }
 
+/**
+ * The shortcut that actually focuses the note search box.
+ *
+ * The label used to read "⌘ K" on every platform, which was wrong twice: Ctrl/
+ * Cmd+K opens the command palette, and Windows and Linux are supported targets
+ * that do not have a Command key.
+ */
+const searchShortcutLabel = () => {
+  const platform =
+    typeof navigator === 'undefined'
+      ? ''
+      : ((navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData
+          ?.platform ??
+        navigator.platform ??
+        navigator.userAgent)
+  return /mac|iphone|ipad|ipod/i.test(platform) ? '⌘F' : 'Ctrl F'
+}
+
 export default function App() {
   const [library, setLibrary] = useState<LibraryInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [bootError, setBootError] = useState('')
-  const [theme, setTheme] = useState<Theme>('system')
+  // Appearance is remembered locally; a Settings control that silently reset on
+  // every launch was telling the user something untrue.
+  const [theme, setTheme] = useState<Theme>(readTheme)
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
+    writeTheme(theme)
   }, [theme])
 
   useEffect(() => {
@@ -241,6 +269,27 @@ function NotesWorkspace({
   )
 
   /**
+   * Cinqic Notes does not navigate to remote pages in this milestone, so an
+   * external link is surfaced as a copyable address rather than being opened.
+   * Letting the WebView follow the link would take the application window to a
+   * remote origin and leave the local-first boundary entirely.
+   */
+  const openExternalLink = useCallback(async (url: string) => {
+    if (!navigator.clipboard?.writeText) {
+      setMessage(`Link: ${url}`)
+      window.setTimeout(() => setMessage(''), 4000)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(url)
+      setMessage('Link address copied — Cinqic Notes does not open remote pages')
+    } catch {
+      setMessage(`Link: ${url}`)
+    }
+    window.setTimeout(() => setMessage(''), 4000)
+  }, [])
+
+  /**
    * Persist any pending edit before leaving the current buffer. Returns false
    * when the note is still dirty, so callers can block the navigation instead
    * of discarding the user's text.
@@ -250,11 +299,16 @@ function NotesWorkspace({
     return autosave.flush()
   }, [autosave])
 
+  // Search requests can resolve out of order. Only the newest request is
+  // allowed to publish its results.
+  const searchGenerationRef = useRef(0)
   const loadNotes = useCallback(
     async (nextQuery = query, includeTrashed = view === 'trash') => {
+      const generation = (searchGenerationRef.current += 1)
       const result = nextQuery.trim()
         ? await notesApi.searchNotesFiltered(nextQuery.trim(), includeTrashed, view === 'archive')
         : await notesApi.listNotesFiltered(includeTrashed, view === 'archive')
+      if (generation !== searchGenerationRef.current) return result
       setNotes(result)
       return result
     },
@@ -313,6 +367,25 @@ function NotesWorkspace({
       .then(setTags)
       .catch(() => setTags([]))
   }, [refresh])
+
+  // Run the search. Nothing previously watched `query`, so typing in the search
+  // box updated the input and changed nothing else: the note list only ever
+  // re-queried when the Library changed underneath it.
+  useEffect(() => {
+    const trimmed = query.trim()
+    const timer = window.setTimeout(
+      () => {
+        void loadNotes(query, view === 'trash').catch((nextError: unknown) =>
+          setError(displayError(nextError)),
+        )
+      },
+      trimmed ? 180 : 0,
+    )
+    return () => window.clearTimeout(timer)
+    // `loadNotes` closes over the current query and view; depending on it here
+    // would re-run this effect on every note-list change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, view])
 
   useEffect(() => {
     if (!isDesktop()) return
@@ -420,7 +493,7 @@ function NotesWorkspace({
 
   const createDailyNote = async () => {
     try {
-      const doc = await notesApi.createDailyNote(new Date().toISOString().slice(0, 10))
+      const doc = await notesApi.createDailyNote(localCalendarDate())
       setView('all')
       activateDocument(doc)
       await refresh(doc.path)
@@ -933,6 +1006,7 @@ function NotesWorkspace({
             )}
             <EditorPane
               document={activeDocument}
+              onExternalLink={(url) => void openExternalLink(url)}
               content={content}
               setContent={(next) => {
                 editContent(next)
@@ -993,10 +1067,14 @@ function NotesWorkspace({
                 }
               }}
               onCopyRevision={(revision) => {
+                if (!navigator.clipboard?.writeText) {
+                  setError('Clipboard is unavailable here.')
+                  return
+                }
                 void navigator.clipboard
-                  ?.writeText(revision.content)
+                  .writeText(revision.content)
                   .then(() => setMessage('Revision copied'))
-                  .catch((nextError: unknown) => setError(displayError(nextError)))
+                  .catch(() => setError('Could not copy — the clipboard was refused.'))
               }}
             />
           </div>
@@ -1113,7 +1191,7 @@ function NoteList({
           placeholder="Search notes"
           aria-label="Search notes"
         />
-        <kbd>⌘ K</kbd>
+        <kbd>{searchShortcutLabel()}</kbd>
       </label>
       <div className="note-filters" aria-label="Note filters">
         <label>
@@ -1251,6 +1329,7 @@ function TrashView({
 
 function EditorPane({
   document,
+  onExternalLink,
   content,
   setContent,
   titleDraft,
@@ -1278,6 +1357,7 @@ function EditorPane({
   onCopyRevision,
 }: {
   document: NoteDocument | null
+  onExternalLink: (url: string) => void
   content: string
   setContent: (value: string) => void
   titleDraft: string
@@ -1304,6 +1384,23 @@ function EditorPane({
   onRestoreRevision: (revisionId: string) => Promise<void>
   onCopyRevision: (revision: RevisionItem) => void
 }) {
+  /**
+   * Activate a rendered external link. The preview never emits a live href, so
+   * nothing happens unless the user deliberately activates the element, and the
+   * host decides what "opening" means rather than the WebView navigating.
+   */
+  const handlePreviewActivate = (
+    event: ReactMouseEvent<HTMLElement> | ReactKeyboardEvent<HTMLElement>,
+  ) => {
+    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>(
+      '[data-external-href]',
+    )
+    const url = target?.dataset.externalHref
+    if (!url) return
+    event.preventDefault()
+    onExternalLink(url)
+  }
+
   const [showMeta, setShowMeta] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
   if (!document)
@@ -1398,6 +1495,10 @@ function EditorPane({
         {showPreview ? (
           <article
             className="markdown-preview"
+            onClick={handlePreviewActivate}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') handlePreviewActivate(event)
+            }}
             dangerouslySetInnerHTML={{ __html: renderSafeMarkdown(content, document.format) }}
           />
         ) : (
@@ -1901,14 +2002,22 @@ function ShareDialog({
 }) {
   const [copied, setCopied] = useState('')
   const copy = async (kind: 'markdown' | 'text') => {
-    const value =
-      kind === 'markdown'
-        ? content
-        : content
-            .split('')
-            .filter((character) => !'*_`#>[]'.includes(character))
-            .join('')
-    await navigator.clipboard?.writeText(value)
+    const value = kind === 'markdown' ? content : toPlainText(content)
+    // Reporting success when the clipboard is unavailable — or when writeText
+    // was rejected because the document was not focused or permission was
+    // refused — tells the user their note is somewhere it is not.
+    if (!navigator.clipboard?.writeText) {
+      setCopied('Clipboard is unavailable here')
+      window.setTimeout(() => setCopied(''), 2600)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(value)
+    } catch {
+      setCopied('Could not copy — the clipboard was refused')
+      window.setTimeout(() => setCopied(''), 2600)
+      return
+    }
     setCopied(kind === 'markdown' ? 'Markdown copied' : 'Plain text copied')
     window.setTimeout(() => setCopied(''), 1800)
   }
@@ -2001,7 +2110,57 @@ function CommandPalette({
   actions: Array<[string, () => void | Promise<void>]>
 }) {
   const [filter, setFilter] = useState('')
-  const visible = actions.filter(([label]) => label.toLowerCase().includes(filter.toLowerCase()))
+  const [selected, setSelected] = useState(0)
+  const listRef = useRef<HTMLDivElement>(null)
+  const visible = useMemo(
+    () => actions.filter(([label]) => label.toLowerCase().includes(filter.toLowerCase())),
+    [actions, filter],
+  )
+
+  // Keep the selection inside the filtered list as the user types.
+  const active = visible.length ? Math.min(selected, visible.length - 1) : -1
+  useEffect(() => setSelected(0), [filter])
+
+  // Follow the selection when it moves out of view via the keyboard.
+  useEffect(() => {
+    if (active < 0) return
+    listRef.current
+      ?.querySelector<HTMLElement>(`[data-index="${active}"]`)
+      ?.scrollIntoView({ block: 'nearest' })
+  }, [active])
+
+  const run = (index: number) => {
+    const entry = visible[index]
+    if (!entry) return
+    void entry[1]()
+    onClose()
+  }
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      onClose()
+      return
+    }
+    if (!visible.length) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setSelected((current) => (current + 1) % visible.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setSelected((current) => (current - 1 + visible.length) % visible.length)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setSelected(0)
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setSelected(visible.length - 1)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      run(active)
+    }
+  }
+
   return (
     <div
       className="modal-backdrop"
@@ -2016,32 +2175,37 @@ function CommandPalette({
         aria-label="Command palette"
       >
         <div className="command-search">
-          <span>⌘</span>
+          <span aria-hidden="true">⌘</span>
           <input
             autoFocus
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
             placeholder="What do you want to do?"
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') onClose()
-              if (event.key === 'Enter' && visible[0]) {
-                void visible[0][1]()
-                onClose()
-              }
-            }}
+            onKeyDown={onKeyDown}
+            role="combobox"
+            aria-expanded={visible.length > 0}
+            aria-controls="command-list"
+            aria-activedescendant={active >= 0 ? `command-option-${active}` : undefined}
+            aria-label="Search commands"
+            autoComplete="off"
           />
         </div>
-        <div className="command-list">
-          {visible.map(([label, action]) => (
+        <div className="command-list" id="command-list" role="listbox" ref={listRef}>
+          {visible.map(([label], index) => (
             <button
               key={label}
-              onClick={() => {
-                void action()
-                onClose()
-              }}
+              id={`command-option-${index}`}
+              data-index={index}
+              role="option"
+              aria-selected={index === active}
+              className={index === active ? 'active' : undefined}
+              // Keep focus in the input so the combobox keeps handling keys.
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => setSelected(index)}
+              onClick={() => run(index)}
             >
               {label}
-              <kbd>↵</kbd>
+              {index === active && <kbd>↵</kbd>}
             </button>
           ))}
           {!visible.length && <p>No matching command.</p>}
@@ -2049,7 +2213,7 @@ function CommandPalette({
         <div className="command-foot">
           <span>↑↓ Navigate</span>
           <span>↵ Run</span>
-          <span>esc Close</span>
+          <span>Esc Close</span>
         </div>
       </section>
     </div>

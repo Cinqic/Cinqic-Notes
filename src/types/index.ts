@@ -1,5 +1,7 @@
 export type NoteFormat = 'markdown' | 'text'
 
+export type Theme = 'system' | 'light' | 'dark'
+
 export type SaveState = 'saved' | 'saving' | 'dirty' | 'conflict' | 'error'
 
 export interface NoteSummary {
