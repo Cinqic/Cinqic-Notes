@@ -93,7 +93,9 @@ in Settings to include them in a backup, and **Restore from ZIP…** to restore 
 backup into a new, empty folder.
 
 Opening a Library re-indexes only when its note files have changed, compared by
-path, size, and modification time.
+path, size, and modification time. The check covers the whole Library at once,
+so the first open after any change — including one the app itself made — still
+rebuilds fully. See [performance](docs/testing/performance.md).
 
 ## Privacy and Juniper
 

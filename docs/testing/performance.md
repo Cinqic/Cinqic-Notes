@@ -43,9 +43,37 @@ Opening now compares a metadata-only fingerprint (path, size, modification time)
 against the one recorded by the last rebuild, and any difference falls through
 to a full rebuild. Listing and search use set-based queries.
 
-Cold index construction is still roughly 1 ms per note. That is a one-time cost
-when the files actually change, and it is the price of rebuilding from the
-canonical files, which is a property worth keeping.
+### When the fast path applies, and when it does not
+
+The fingerprint is all-or-nothing for the whole Library, and it is only written
+by a full rebuild. So the first open after _any_ note changed — including a note
+the app itself saved — rebuilds the entire index. Measured at 10,000 notes:
+
+| Sequence                        | Wall time |
+| ------------------------------- | --------- |
+| Open, nothing changed           | 0.20 s    |
+| Open, after one note was edited | 11.32 s   |
+| Open again, still unchanged     | 0.07 s    |
+
+So a session that edits notes pays a full rebuild on the next launch. This is
+strictly better than before, when every launch rebuilt unconditionally, but the
+0.06 s figure describes an unchanged Library, not the common edit-then-relaunch
+case.
+
+The obvious shortcut — refreshing the fingerprint after each save — is **not
+safe** and was deliberately not done. Saving one note makes the index current
+for that note only; recording a whole-Library fingerprint at that moment would
+assert that every other file is indexed too. A note changed outside the app
+while it was closed would then be skipped on the next open and never indexed.
+
+Removing the remaining cost needs per-file state (path, size, modification time
+per note) so that an open can re-index only what actually changed. That is a
+real change to the index schema and was left out of this stabilisation branch
+rather than added under time pressure.
+
+Cold index construction is roughly 1 ms per note. It is the price of being able
+to rebuild everything from the canonical files, which is a property worth
+keeping.
 
 ## Not measured
 
