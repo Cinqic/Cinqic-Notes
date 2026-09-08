@@ -12,10 +12,10 @@ data, not application content.
 
 ## Measured results
 
-Candidate: `review/stabilization-0.1.x`. Environment: Linux 7.0.0-31-generic,
-AMD Ryzen 7 5700G (16 cores), 14 GB RAM, ext4, release build of
-`cinqic-notes-cli`, timed with `/usr/bin/time`. The CLI opens a Library through
-the same `Library::open` path the desktop app uses.
+Candidate: `b74c2ed`, the tip of the 0.1.x stabilisation work, since merged into
+`main`. Environment: Linux 7.0.0-31-generic, AMD Ryzen 7 5700G (16 cores), 14 GB
+RAM, ext4, release build of `cinqic-notes-cli`, timed with `/usr/bin/time`. The
+CLI opens a Library through the same `Library::open` path the desktop app uses.
 
 10,000 notes:
 
