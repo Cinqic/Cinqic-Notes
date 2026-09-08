@@ -205,6 +205,10 @@ pub fn parse_note(path: &Path, content: &str) -> ParsedNote {
         .replace(['_', '-'], " ");
     let mut project = false;
     let mut in_frontmatter = false;
+    // Which frontmatter key's block list we are currently inside, if any. Without
+    // this, every `- item` in the frontmatter was collected as a tag, so an
+    // `authors:` or `aliases:` list silently became tags.
+    let mut frontmatter_key: Option<String> = None;
     let mut heading_seen = false;
     let mut tags = Vec::new();
     let mut tasks = Vec::new();
@@ -218,20 +222,42 @@ pub fn parse_note(path: &Path, content: &str) -> ParsedNote {
         }
         if in_frontmatter && trimmed == "---" {
             in_frontmatter = false;
+            frontmatter_key = None;
             continue;
         }
         if in_frontmatter {
-            if let Some(value) = trimmed.strip_prefix("type:") {
-                project = value.trim().eq_ignore_ascii_case("project");
-            }
-            if trimmed == "tags:" {
+            if trimmed.is_empty() {
                 continue;
             }
-            if let Some(value) = trimmed.strip_prefix('-') {
-                let value = value.trim().trim_matches(['"', '\'']);
-                if !value.is_empty() && !value.contains(' ') {
-                    tags.push(value.to_ascii_lowercase());
+            // A block-list entry belongs to the key that opened the list.
+            if let Some(value) = trimmed.strip_prefix("- ").or_else(|| {
+                (trimmed == "-")
+                    .then_some("")
+                    .or_else(|| trimmed.strip_prefix('-'))
+            }) {
+                if frontmatter_key.as_deref() == Some("tags") {
+                    push_tag(value, &mut tags);
                 }
+                continue;
+            }
+            if let Some((key, value)) = split_frontmatter_entry(trimmed) {
+                frontmatter_key = Some(key.to_ascii_lowercase());
+                match key.to_ascii_lowercase().as_str() {
+                    "type" => project = value.eq_ignore_ascii_case("project"),
+                    "tags" => {
+                        // Inline forms: `tags: [a, b]` and `tags: a, b`.
+                        let inline = value.trim();
+                        let inline = inline
+                            .strip_prefix('[')
+                            .and_then(|rest| rest.strip_suffix(']'))
+                            .unwrap_or(inline);
+                        for entry in inline.split(',') {
+                            push_tag(entry, &mut tags);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
             }
             continue;
         }
@@ -280,6 +306,30 @@ fn parse_task(line_number: i64, line: &str) -> Option<TaskSeed> {
         checked,
         text: trimmed[6..].trim().to_owned(),
     })
+}
+
+/// Split a `key: value` frontmatter entry, ignoring lines that are not one.
+fn split_frontmatter_entry(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    if key.is_empty() || key.contains(' ') || key.starts_with('#') {
+        return None;
+    }
+    Some((key, value.trim()))
+}
+
+/// Record one frontmatter tag, matching the `#tag` character set used in the body.
+fn push_tag(value: &str, tags: &mut Vec<String>) {
+    let value = value.trim().trim_matches(['"', '\'']).trim();
+    let value = value.strip_prefix('#').unwrap_or(value);
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_' || character == '-')
+    {
+        return;
+    }
+    tags.push(value.to_ascii_lowercase());
 }
 
 fn collect_tags(line: &str, tags: &mut Vec<String>) {
@@ -363,4 +413,111 @@ pub fn preview(content: &str) -> String {
         .chars()
         .take(140)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(content: &str) -> ParsedNote {
+        parse_note(Path::new("Notes/Sample.md"), content)
+    }
+
+    #[test]
+    fn frontmatter_tags_come_only_from_the_tags_key() {
+        let note = parse(
+            "---\ntype: project\nauthors:\n  - alice\n  - bob\ntags:\n  - work\n  - urgent\n---\n\n# Sample\n",
+        );
+        assert_eq!(note.tags, vec!["urgent", "work"]);
+        assert!(note.project);
+    }
+
+    #[test]
+    fn an_unrelated_yaml_list_is_not_treated_as_tags() {
+        let note = parse("---\naliases:\n  - Alias One\n  - second\nrelated:\n  - other\n---\n");
+        assert!(
+            note.tags.is_empty(),
+            "unexpected tags from unrelated lists: {:?}",
+            note.tags
+        );
+    }
+
+    #[test]
+    fn inline_frontmatter_tag_forms_are_supported() {
+        assert_eq!(
+            parse("---\ntags: [alpha, beta]\n---\n").tags,
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(
+            parse("---\ntags: alpha, beta\n---\n").tags,
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(parse("---\ntags: \"quoted\"\n---\n").tags, vec!["quoted"]);
+        assert_eq!(parse("---\ntags: #hashed\n---\n").tags, vec!["hashed"]);
+    }
+
+    #[test]
+    fn frontmatter_tags_reject_values_that_are_not_tag_shaped() {
+        let note = parse("---\ntags:\n  - two words\n  - ok-tag\n  - \"\"\n---\n");
+        assert_eq!(note.tags, vec!["ok-tag"]);
+    }
+
+    #[test]
+    fn frontmatter_is_only_recognised_at_the_top_of_the_file() {
+        // A horizontal rule mid-document must not open a frontmatter block.
+        let note = parse("# Sample\n\n---\n\ntags:\n  - notatag\n");
+        assert!(note.tags.is_empty(), "{:?}", note.tags);
+    }
+
+    #[test]
+    fn body_hash_tags_are_collected_but_headings_are_not() {
+        let note = parse("# Heading\n\nSome text #alpha and #beta-two.\n\n## Another\n");
+        assert_eq!(note.tags, vec!["alpha", "beta-two"]);
+    }
+
+    #[test]
+    fn tags_are_lowercased_sorted_and_deduplicated() {
+        let note = parse("---\ntags:\n  - Work\n---\n\nBody #work #Work #ALPHA\n");
+        assert_eq!(note.tags, vec!["alpha", "work"]);
+    }
+
+    #[test]
+    fn the_title_comes_from_the_first_heading_then_the_file_name() {
+        assert_eq!(parse("# Real Title\n").title, "Real Title");
+        assert_eq!(parse("no heading here\n").title, "Sample");
+        // Frontmatter must not be mistaken for the heading.
+        assert_eq!(parse("---\ntags:\n  - x\n---\n\n# After\n").title, "After");
+    }
+
+    #[test]
+    fn tasks_record_their_line_and_checked_state() {
+        let note = parse("# T\n\n- [ ] open item\n- [x] done item\n- plain bullet\n");
+        assert_eq!(note.tasks.len(), 2);
+        assert!(!note.tasks[0].checked);
+        assert_eq!(note.tasks[0].text, "open item");
+        assert!(note.tasks[1].checked);
+        assert_eq!(note.tasks[1].line, 4);
+    }
+
+    #[test]
+    fn wiki_and_markdown_links_are_collected() {
+        let note = parse("# L\n\nSee [[Other Note]] and [Local](Notes/Local.md).\n");
+        let targets: Vec<_> = note.links.iter().map(|link| link.target.as_str()).collect();
+        assert!(targets.contains(&"Other Note"), "{targets:?}");
+        assert!(targets.contains(&"Notes/Local.md"), "{targets:?}");
+    }
+
+    #[test]
+    fn unicode_content_is_preserved() {
+        let note = parse("# Ünïcode ✓\n\nText with #café and 日本語.\n");
+        assert_eq!(note.title, "Ünïcode ✓");
+        assert!(note.tags.contains(&"café".to_string()), "{:?}", note.tags);
+    }
+
+    #[test]
+    fn an_unterminated_frontmatter_block_does_not_swallow_the_document() {
+        let note = parse("---\ntags:\n  - work\n");
+        assert_eq!(note.tags, vec!["work"]);
+    }
 }
