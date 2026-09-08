@@ -7,7 +7,9 @@ SQLite index provides fast local search, links, backlinks, and tasks.
 ## Product posture
 
 - No account, cloud service, telemetry, or AI is required.
-- Markdown and plain text are canonical; the SQLite database is rebuildable.
+- Markdown and plain text are canonical. Search, tags, links, and tasks are
+  rebuildable from those files; revisions, trash, conflicts, and settings live
+  only in `.cinqic/`. See [PRIVACY.md](PRIVACY.md) for the precise split.
 - Autosave is local and debounced, with revisions and optimistic conflict checks.
 - `[[Wiki Links]]`, Markdown links, tags, projects, checklists, and local export
   are supported without a network connection.
@@ -22,8 +24,9 @@ verified in this repository.
 
 ## Development
 
-Requirements: Node.js 22+, pnpm 11, Rust 1.90+, and the Tauri 2 desktop
-prerequisites for the platform being built.
+Requirements: Node.js 22+, pnpm 11.19.0 (pinned via `packageManager`; run
+`corepack enable`), Rust 1.90+, and the Tauri 2 desktop prerequisites for the
+platform being built.
 
 ```powershell
 pnpm install
@@ -33,9 +36,17 @@ pnpm validate
 pnpm tauri:dev
 ```
 
-`pnpm validate` is the canonical frontend/native validation command. It runs
-formatting, lint, type checking, frontend tests, schema checks, and the Rust
-format/test/clippy checks when the Rust toolchain is available.
+`pnpm validate` is the canonical validation command and the gate a release must
+pass. It runs formatting, lint, type checking, frontend tests, the production
+build, Rust format, Clippy with warnings denied, Rust tests, schema validation,
+and version consistency. The release workflow runs it against the exact tagged
+commit before anything is packaged.
+
+Before a public release, regenerate the dependency licence inventory:
+
+```powershell
+pnpm license:inventory
+```
 
 The same Notes Core can be used headlessly through the local CLI during
 development:
@@ -45,8 +56,17 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin cinqic-notes-cli -- <Librar
 cargo run --manifest-path src-tauri/Cargo.toml --bin cinqic-notes-cli -- <Library> search "meeting notes"
 ```
 
-The CLI has no server listener and uses the same path validation, optimistic
-write, revision, and export behavior as the desktop app.
+The CLI has no server listener and uses the same path validation, revision, and
+export behaviour as the desktop app. For the same optimistic write the editor
+performs, pass the hash from a previous `get`:
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --bin cinqic-notes-cli -- <Library> update Note.md "new content" --expect <hash>
+```
+
+Without `--expect`, an update is still refused when the file changed on disk
+behind the index, but a caller holding a stale copy can overwrite a newer
+indexed change.
 
 ## Library format and storage
 
@@ -61,17 +81,25 @@ My Library/
 └── .cinqic/
     ├── index.sqlite3
     ├── recovery/
-    └── revisions/
+    └── trash/
 ```
 
-Deleting `.cinqic/index.sqlite3` cannot delete note contents. Use **Rebuild
-index** in Settings to reconstruct search and relationship data from files.
-Revision copies are local safety history, not the canonical document.
+Deleting `.cinqic/index.sqlite3` cannot delete note contents: the next open
+rebuilds search and relationship data from the files themselves, and **Rebuild
+index** in Settings forces it. Revision history, trash, and unresolved conflicts
+are stored inside that database and are local safety history rather than
+canonical documents — deleting `.cinqic/` discards them. Use **Full backup ZIP**
+in Settings to include them in a backup, and **Restore from ZIP…** to restore a
+backup into a new, empty folder.
+
+Opening a Library re-indexes only when its note files have changed, compared by
+path, size, and modification time.
 
 ## Privacy and Juniper
 
 The app makes no network requests and has no telemetry or remote fonts. Remote
-images are not fetched by the preview. See [PRIVACY.md](PRIVACY.md) and
+images are not fetched by the preview, and external links are rendered without a
+live `href` so a click cannot navigate the app to a remote page. See [PRIVACY.md](PRIVACY.md) and
 [SECURITY.md](SECURITY.md). Juniper is not required and no Juniper connector is
 enabled in this milestone; the stable local Notes Core boundary is documented
 in [docs/architecture/notes-core.md](docs/architecture/notes-core.md).
@@ -83,6 +111,8 @@ in [docs/architecture/notes-core.md](docs/architecture/notes-core.md).
   export logic.
 - `schemas/` — versioned machine-facing Notes Core contracts.
 - `docs/adr/` — concise architectural decisions.
-- `.github/workflows/` — validation and packaging workflows.
+- `.github/workflows/` — the reusable validation gate, plus packaging and
+  release workflows that both call it.
+- `docs/licenses/inventory.md` — generated transitive dependency licences.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
