@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AutosaveController } from './autosave'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
 import { notesApi } from '../lib/api'
@@ -179,6 +180,76 @@ function NotesWorkspace({
   const activePathRef = useRef<string | null>(null)
   activePathRef.current = activeDocument?.path ?? null
 
+  // Autosave is owned by a serialized controller rather than a bare debounce so
+  // that a late save completion can never overwrite a newer edit, and so that
+  // pending work is flushed — not cancelled — when the user navigates away.
+  const autosaveRef = useRef<AutosaveController | null>(null)
+  if (autosaveRef.current === null) {
+    autosaveRef.current = new AutosaveController({
+      save: async ({ path, content: next, expectedHash }) => {
+        const doc = await notesApi.updateNote(path, next, expectedHash)
+        return { path: doc.path, content: doc.content, hash: doc.hash }
+      },
+      onChange: (snapshot) => setSaveState(snapshot.state),
+      onSaved: (result) => {
+        setActiveDocument((current) =>
+          current && current.path === result.path ? { ...current, hash: result.hash } : current,
+        )
+        setNotes((current) =>
+          current.map((note) =>
+            note.path === result.path ? { ...note, hash: result.hash } : note,
+          ),
+        )
+        setMessage('Saved locally')
+        window.setTimeout(() => setMessage(''), 1800)
+      },
+      onError: (nextError, state) => {
+        setError(displayError(nextError))
+        if (state !== 'conflict') return
+        const path = activePathRef.current
+        if (!path) return
+        void notesApi
+          .getConflict(path)
+          .then(setConflict)
+          .catch(() => undefined)
+      },
+    })
+  }
+  const autosave = autosaveRef.current
+
+  /** Point the editor at a document whose content already matches disk. */
+  const activateDocument = useCallback(
+    (doc: NoteDocument, override?: string) => {
+      const next = override ?? doc.content
+      setActiveDocument(doc)
+      setContent(next)
+      setTitleDraft(doc.title)
+      activePathRef.current = doc.path
+      autosave.activate(doc.path, doc.content, doc.hash)
+      if (override !== undefined && override !== doc.content) autosave.edit(override)
+    },
+    [autosave],
+  )
+
+  /** Record a user edit in both the rendered buffer and the save controller. */
+  const editContent = useCallback(
+    (next: string) => {
+      setContent(next)
+      autosave.edit(next)
+    },
+    [autosave],
+  )
+
+  /**
+   * Persist any pending edit before leaving the current buffer. Returns false
+   * when the note is still dirty, so callers can block the navigation instead
+   * of discarding the user's text.
+   */
+  const flushPending = useCallback(async () => {
+    if (!autosave.isDirty) return true
+    return autosave.flush()
+  }, [autosave])
+
   const loadNotes = useCallback(
     async (nextQuery = query, includeTrashed = view === 'trash') => {
       const result = nextQuery.trim()
@@ -190,27 +261,29 @@ function NotesWorkspace({
     [query, view],
   )
 
-  const selectNote = useCallback(async (path: string) => {
-    try {
-      const doc = await notesApi.getNote(path)
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
-      setSaveState('saved')
-      setError('')
-      setConflict(null)
-      const [nextBacklinks, nextRevisions, nextOutgoingLinks] = await Promise.all([
-        notesApi.getBacklinks(path),
-        notesApi.listRevisions(path),
-        notesApi.getOutgoingLinks(path),
-      ])
-      setBacklinks(nextBacklinks)
-      setRevisions(nextRevisions)
-      setOutgoingLinks(nextOutgoingLinks)
-    } catch (nextError: unknown) {
-      setError(displayError(nextError))
-    }
-  }, [])
+  const selectNote = useCallback(
+    async (path: string) => {
+      // Never drop an unsaved buffer to load another note.
+      if (!(await flushPending())) return
+      try {
+        const doc = await notesApi.getNote(path)
+        activateDocument(doc)
+        setError('')
+        setConflict(null)
+        const [nextBacklinks, nextRevisions, nextOutgoingLinks] = await Promise.all([
+          notesApi.getBacklinks(path),
+          notesApi.listRevisions(path),
+          notesApi.getOutgoingLinks(path),
+        ])
+        setBacklinks(nextBacklinks)
+        setRevisions(nextRevisions)
+        setOutgoingLinks(nextOutgoingLinks)
+      } catch (nextError: unknown) {
+        setError(displayError(nextError))
+      }
+    },
+    [activateDocument, flushPending],
+  )
 
   const refresh = useCallback(
     async (preferredPath?: string) => {
@@ -221,6 +294,7 @@ function NotesWorkspace({
         else if (!nextNotes.length) {
           setActiveDocument(null)
           setContent('')
+          autosave.deactivate()
           setBacklinks([])
           setRevisions([])
           setOutgoingLinks([])
@@ -229,7 +303,7 @@ function NotesWorkspace({
         setError(displayError(nextError))
       }
     },
-    [activeDocument?.path, loadNotes, selectNote, view],
+    [activeDocument?.path, autosave, loadNotes, selectNote, view],
   )
 
   useEffect(() => {
@@ -278,51 +352,24 @@ function NotesWorkspace({
     return () => window.clearTimeout(timer)
   }, [activeDocument, content, saveState])
 
+  // Flush an in-progress edit when the window is going away. `beforeunload`
+  // fires for both the browser dev shell and a Tauri window close.
   useEffect(() => {
-    if (!activeDocument || saveState !== 'dirty') return
-    const path = activeDocument.path
-    const expectedHash = activeDocument.hash
-    const contentToSave = content
-    const timer = window.setTimeout(() => {
-      setSaveState('saving')
-      notesApi
-        .updateNote(path, contentToSave, expectedHash)
-        .then((doc) => {
-          const stillEditing = activePathRef.current === path
-          if (stillEditing) {
-            setActiveDocument(doc)
-            setNotes((current) => current.map((note) => (note.path === path ? doc : note)))
-            if (content === contentToSave) {
-              setContent(doc.content)
-              setSaveState('saved')
-              setMessage('Saved locally')
-              setTimeout(() => setMessage(''), 1800)
-            } else {
-              setActiveDocument(doc)
-              setSaveState('dirty')
-            }
-          }
-        })
-        .catch((nextError: unknown) => {
-          setSaveState('conflict')
-          setError(displayError(nextError))
-          void notesApi
-            .getConflict(path)
-            .then(setConflict)
-            .catch(() => undefined)
-        })
-    }, 450)
-    return () => window.clearTimeout(timer)
-  }, [activeDocument, content, saveState])
+    const handler = (event: BeforeUnloadEvent) => {
+      if (!autosave.isDirty) return
+      void autosave.flush()
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [autosave])
 
   const createNote = async (startingTitle = 'Untitled') => {
     try {
       const doc = await notesApi.createNote(startingTitle, 'markdown')
       setView('all')
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
-      setSaveState('saved')
+      activateDocument(doc)
       setNotes((current) => [doc, ...current.filter((note) => note.path !== doc.path)])
       setBacklinks([])
       setRevisions([])
@@ -350,31 +397,17 @@ function NotesWorkspace({
   }
 
   const forceSave = async (): Promise<boolean> => {
-    if (!activeDocument || saveState === 'saving') return false
-    try {
-      setSaveState('saving')
-      const doc = await notesApi.updateNote(activeDocument.path, content, activeDocument.hash)
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setRevisions(await notesApi.listRevisions(doc.path))
-      setSaveState('saved')
-      setMessage('Saved locally')
-      window.setTimeout(() => setMessage(''), 1800)
-      return true
-    } catch (nextError: unknown) {
-      setSaveState('conflict')
-      setError(displayError(nextError))
-      return false
-    }
+    if (!activeDocument) return false
+    const saved = await autosave.flush()
+    if (saved) setRevisions(await notesApi.listRevisions(activeDocument.path))
+    return saved
   }
 
   const renameNote = async () => {
     if (!activeDocument || !titleDraft.trim() || titleDraft.trim() === activeDocument.title) return
     try {
       const doc = await notesApi.renameNote(activeDocument.path, titleDraft.trim())
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
+      activateDocument(doc)
       setNotes((current) => current.map((note) => (note.path === activeDocument.path ? doc : note)))
       setBacklinks(await notesApi.getBacklinks(doc.path))
       setRevisions(await notesApi.listRevisions(doc.path))
@@ -389,10 +422,7 @@ function NotesWorkspace({
     try {
       const doc = await notesApi.createDailyNote(new Date().toISOString().slice(0, 10))
       setView('all')
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
-      setSaveState('saved')
+      activateDocument(doc)
       await refresh(doc.path)
       window.setTimeout(() => editorRef.current?.focus(), 50)
     } catch (nextError: unknown) {
@@ -406,9 +436,7 @@ function NotesWorkspace({
     if (folder === null) return
     try {
       const doc = await notesApi.moveNote(activeDocument.path, folder.trim())
-      setActiveDocument(doc)
-      setContent(doc.content)
-      setTitleDraft(doc.title)
+      activateDocument(doc)
       await refresh(doc.path)
       setMessage('Note moved')
     } catch (nextError: unknown) {
@@ -425,14 +453,13 @@ function NotesWorkspace({
       if (archived && view !== 'archive') {
         setActiveDocument(null)
         setContent('')
+        autosave.deactivate()
         setBacklinks([])
         setRevisions([])
         setOutgoingLinks([])
         await refresh()
       } else {
-        setActiveDocument(doc)
-        setContent(doc.content)
-        setTitleDraft(doc.title)
+        activateDocument(doc)
         await refresh(doc.path)
       }
     } catch (nextError: unknown) {
@@ -462,11 +489,7 @@ function NotesWorkspace({
         const image = /\.(png|jpe?g|gif|webp|svg)$/i.test(attachment.path)
         links.push(image ? '![' + name + '](' + relative + ')' : '[' + name + '](' + relative + ')')
       }
-      setContent(
-        (current) =>
-          current + (current.endsWith('\n') ? '' : '\n') + '\n' + links.join('\n') + '\n',
-      )
-      setSaveState('dirty')
+      editContent(content + (content.endsWith('\n') ? '' : '\n') + '\n' + links.join('\n') + '\n')
       setMessage(links.length + ' attachment' + (links.length === 1 ? '' : 's') + ' added')
     } catch (nextError: unknown) {
       setError(displayError(nextError))
@@ -489,8 +512,7 @@ function NotesWorkspace({
     try {
       const doc = await notesApi.toggleTask(task.id, !task.checked)
       if (activeDocument?.path === doc.path) {
-        setActiveDocument(doc)
-        setContent(doc.content)
+        activateDocument(doc)
       }
       setTasks((current) =>
         current.map((item) => (item.id === task.id ? { ...item, checked: !item.checked } : item)),
@@ -541,10 +563,7 @@ function NotesWorkspace({
       ])
       setView('all')
       setShowSettings(false)
-      setActiveDocument(doc)
-      setContent(draftContent)
-      setTitleDraft(doc.title)
-      setSaveState('dirty')
+      activateDocument(doc, draftContent)
       setConflict(null)
       setBacklinks(await notesApi.getBacklinks(doc.path))
       setRevisions(await notesApi.listRevisions(doc.path))
@@ -556,7 +575,7 @@ function NotesWorkspace({
   }
 
   const changeLibrary = async () => {
-    if (saveState === 'dirty' && !(await forceSave())) return
+    if (!(await flushPending())) return
     try {
       const chosen = await open({ directory: true, multiple: false })
       const path = Array.isArray(chosen) ? chosen[0] : chosen
@@ -566,6 +585,7 @@ function NotesWorkspace({
       setLibrary(nextLibrary)
       setActiveDocument(null)
       setContent('')
+      autosave.deactivate()
       setTitleDraft('')
       setNotes([])
       setBacklinks([])
@@ -632,8 +652,7 @@ function NotesWorkspace({
         const end = editor.selectionEnd
         const marker = event.key.toLowerCase() === 'b' ? '**' : '*'
         const selected = content.slice(start, end)
-        setContent(content.slice(0, start) + marker + selected + marker + content.slice(end))
-        setSaveState('dirty')
+        editContent(content.slice(0, start) + marker + selected + marker + content.slice(end))
         requestAnimationFrame(() => {
           editor.focus()
           editor.setSelectionRange(start + marker.length, end + marker.length)
@@ -866,10 +885,7 @@ function NotesWorkspace({
               try {
                 const doc = await notesApi.restoreNote(path)
                 setView('all')
-                setActiveDocument(doc)
-                setContent(doc.content)
-                setTitleDraft(doc.title)
-                setSaveState('saved')
+                activateDocument(doc)
                 await refresh(doc.path)
                 setMessage('Note restored')
               } catch (nextError: unknown) {
@@ -919,8 +935,7 @@ function NotesWorkspace({
               document={activeDocument}
               content={content}
               setContent={(next) => {
-                setContent(next)
-                setSaveState('dirty')
+                editContent(next)
               }}
               titleDraft={titleDraft}
               setTitleDraft={setTitleDraft}
@@ -948,10 +963,8 @@ function NotesWorkspace({
                   void notesApi
                     .resolveConflict(activeDocument.path, resolution)
                     .then((doc) => {
-                      setActiveDocument(doc)
-                      setContent(doc.content)
+                      activateDocument(doc)
                       setConflict(null)
-                      setSaveState('saved')
                       return Promise.all([
                         notesApi.getBacklinks(doc.path),
                         notesApi.listRevisions(doc.path),
@@ -970,12 +983,10 @@ function NotesWorkspace({
                 if (!activeDocument) return
                 try {
                   const doc = await notesApi.restoreRevision(activeDocument.path, revisionId)
-                  setActiveDocument(doc)
-                  setContent(doc.content)
+                  activateDocument(doc)
                   setBacklinks(await notesApi.getBacklinks(doc.path))
                   setRevisions(await notesApi.listRevisions(doc.path))
                   setOutgoingLinks(await notesApi.getOutgoingLinks(doc.path))
-                  setSaveState('saved')
                   setMessage('Revision restored')
                 } catch (nextError: unknown) {
                   setError(displayError(nextError))
