@@ -1,5 +1,17 @@
 # Cinqic Notes agent guide
 
+## Project status: development paused (2026-09-17)
+
+- Development is paused and the repository is archived. [PAUSED.md](PAUSED.md) and
+  [README.md](README.md) are authoritative for project status.
+- Ordinary feature development is not authorized just because the repository can be
+  edited, including after a future unarchive. Do not resume development without an
+  explicit decision from the Cinqic owner.
+- Preserve historical files and evidence. Do not rewrite earlier documents, measured
+  results, or "Not performed" records to reflect later status.
+
+## Technical rules
+
 - The user's Markdown and text files are the source of truth. Search, tags,
   links, and tasks must always be rebuildable from those files. The rest of
   `.cinqic/` — revisions, trash, conflicts, archive flags, settings — is not

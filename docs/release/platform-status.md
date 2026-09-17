@@ -1,5 +1,10 @@
 # Platform status
 
+> **Status notice — development paused 2026-09-17.** This document records
+> historical development evidence as it stood when Cinqic Notes development was
+> paused. It is not an active support matrix, and no platform is supported. Its
+> results were not re-verified for the pause. See [PAUSED.md](../../PAUSED.md).
+
 This file states exactly what has been verified, and by whom. Nothing here is
 inferred from a successful compile.
 

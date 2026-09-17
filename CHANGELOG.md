@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-09-17 — Development paused
+
+This is a project-status entry, not a software release. No version was
+assigned.
+
+- Paused active development of Cinqic Notes until further notice. The project
+  is not retired or discontinued. See [PAUSED.md](PAUSED.md).
+- Prepared the repository for public archival as a read-only snapshot that can
+  be unarchived if development resumes.
+- Updated the README, contributing guide, security policy, agent guide, and
+  platform status notice to reflect the pause.
+- No release was made. No package, installer, or GitHub Release was published,
+  and the application version remains `0.1.0`.
+- Preserved Git history, source, tests, architectural records, release
+  infrastructure, and existing evidence, including incomplete evidence.
+- Tagged the pause state `paused-2026-09-17`. The tag is not a release.
+
 ## Unreleased — stabilisation
 
 Data durability
