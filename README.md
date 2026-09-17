@@ -4,6 +4,13 @@ A local-first notes and lightweight document app by Cinqic. Your notes remain
 ordinary Markdown or text files in a Library you choose, while a disposable
 SQLite index provides fast local search, links, backlinks, and tasks.
 
+> **Development paused — September 17, 2026**
+>
+> Cinqic Notes development is paused until further notice. The project is not
+> retired or discontinued. This repository is preserved as a public read-only
+> archive and may be unarchived if development resumes. No public release
+> exists. See [PAUSED.md](PAUSED.md).
+
 ## Product posture
 
 - No account, cloud service, telemetry, or AI is required.
@@ -18,11 +25,16 @@ SQLite index provides fast local search, links, backlinks, and tasks.
   and the device share sheet when the platform provides one.
 - Juniper integration is a documented future contract, disabled by default.
 
-This is an early development milestone (`0.1.0`). It is not a collaboration or
-cloud-sync product, and it does not claim platform support that has not been
-verified in this repository.
+Development paused at an early development milestone (`0.1.0`) plus unreleased
+0.1.x stabilisation work. It is not a collaboration or cloud-sync product, and
+it does not claim platform support that has not been verified in this
+repository.
 
 ## Development
+
+Development is paused. The instructions below are kept so the project can be
+built, validated, and resumed from this snapshot; they do not mean the project
+is currently maintained.
 
 Requirements: Node.js 22+, pnpm 11.19.0 (pinned via `packageManager`; run
 `corepack enable`), Rust 1.90+, and the Tauri 2 desktop prerequisites for the
@@ -116,6 +128,8 @@ in [docs/architecture/notes-core.md](docs/architecture/notes-core.md).
 - `.github/workflows/` — the reusable validation gate, plus packaging and
   release workflows that both call it.
 - `docs/licenses/inventory.md` — generated transitive dependency licences.
+- `PAUSED.md` — the development pause record, project state at pause, and
+  resumption procedure.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
 
